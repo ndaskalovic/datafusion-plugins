@@ -4,7 +4,8 @@
 //! right rows, sparse left, strict matches, horizons longer than a group's
 //! span, timestamps near the i64 limits, and the error cases.
 
-use std::fs::File;
+mod common;
+
 use std::sync::Arc;
 
 use arrow::array::{
@@ -13,11 +14,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::TableProvider;
-use datafusion::parquet::arrow::ArrowWriter;
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
-use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, col};
-use datafusion_plugins::{JoinAsofMarkouts, Markout, PlanBytesTable};
+use datafusion::prelude::{ParquetReadOptions, SessionContext, col};
+use datafusion_plugins::{JoinAsof, Markout, NodeTable, PlanInputs};
+
+use common::{Rng, write_parquet};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum By {
@@ -48,19 +49,6 @@ struct Case {
     null_per_mille: u64,
     strict: bool,
     row_group: usize,
-}
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +106,7 @@ fn ts_array(c: &Case, rows: &[Row]) -> ArrayRef {
     }
 }
 
-fn write_parquet(path: &std::path::Path, c: &Case, rows: &[Row], payload: &str) {
+fn write_case_file(path: &std::path::Path, c: &Case, rows: &[Row], payload: &str) {
     let mut fields = vec![Field::new("id", DataType::Int64, false)];
     let mut cols: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.id)))];
     match c.by {
@@ -146,12 +134,8 @@ fn write_parquet(path: &std::path::Path, c: &Case, rows: &[Row], payload: &str) 
     cols.push(ts_array(c, rows));
     fields.push(Field::new(payload, DataType::Float64, false));
     cols.push(Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.id as f64))));
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), cols).unwrap();
-    let props = WriterProperties::builder().set_max_row_group_row_count(Some(c.row_group)).build();
-    let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+    write_parquet(path, &batch, c.row_group);
 }
 
 /// Shift of markout `m` (decimal seconds) in the unit, exactly.
@@ -200,17 +184,12 @@ fn reference(c: &Case, left: &[Row], right: &[Row]) -> Vec<Vec<Option<i64>>> {
 }
 
 fn context() -> SessionContext {
-    let config = SessionConfig::new()
-        .with_target_partitions(4)
-        .with_batch_size(64)
-        .set_usize("datafusion.optimizer.repartition_file_min_size", 1)
-        .set_bool("datafusion.execution.enable_file_stream_work_stealing", false);
-    SessionContext::new_with_config(config)
+    common::context(4, 64)
 }
 
-fn node(c: &Case) -> JoinAsofMarkouts {
+fn node(c: &Case) -> JoinAsof {
     let ms = c.markouts.iter().map(|m| Markout::parse(m).unwrap()).collect();
-    let n = JoinAsofMarkouts::new("ts", ms).allow_exact_matches(!c.strict);
+    let n = JoinAsof::new("ts").markouts(ms).assume_sorted(true).allow_exact_matches(!c.strict);
     match c.by {
         By::None => n,
         By::Multi => n.by(["g", "h"]),
@@ -263,7 +242,7 @@ async fn run(c: &Case, dir: &std::path::Path, ordered: bool) -> Result<(Vec<(i64
     let r = read(&ctx, c, &dir.join("right.parquet"), ordered).await;
     let left = l.create_physical_plan().await.unwrap();
     let right = r.create_physical_plan().await.unwrap();
-    let plan = node(c).build(left, right, None, ctx.state().config_options()).map_err(|e| e.to_string())?;
+    let plan = node(c).build(left, right, ctx.state().config_options()).map_err(|e| e.to_string())?;
     let s = displayable(plan.as_ref()).indent(true).to_string();
     let b = collect(plan, ctx.task_ctx()).await.map_err(|e| e.to_string())?;
     Ok((rows_of(c, &b), s))
@@ -275,7 +254,8 @@ async fn run_plan_bytes(c: &Case, dir: &std::path::Path) -> Vec<(i64, Vec<Option
     let r = read(&ctx, c, &dir.join("right.parquet"), true).await;
     let lb = datafusion_proto::bytes::logical_plan_to_bytes(l.logical_plan()).unwrap();
     let rb = datafusion_proto::bytes::logical_plan_to_bytes(r.logical_plan()).unwrap();
-    let t = PlanBytesTable::try_new(vec![lb.to_vec(), rb.to_vec()], Arc::new(node(c)), None).unwrap();
+    let inputs = PlanInputs::try_new(vec![lb.to_vec(), rb.to_vec()]).unwrap();
+    let t = NodeTable::try_new(Arc::new(inputs), Arc::new(node(c))).unwrap();
     // Only id and the payloads: exercises the projection.
     let s = t.schema();
     let proj: Vec<usize> = std::iter::once("id".to_string())
@@ -291,8 +271,8 @@ async fn check(c: Case) {
     let mut rng = Rng(c.seed.max(1));
     let left = gen_rows(&mut rng, c.n_left, c.left_groups, &c, 0);
     let right = gen_rows(&mut rng, c.n_right, c.right_groups, &c, 1_000_000);
-    write_parquet(&dir.path().join("left.parquet"), &c, &left, "lpx");
-    write_parquet(&dir.path().join("right.parquet"), &c, &right, "rid");
+    write_case_file(&dir.path().join("left.parquet"), &c, &left, "lpx");
+    write_case_file(&dir.path().join("right.parquet"), &c, &right, "rid");
     let want = reference(&c, &left, &right);
     let cmp = |name: &str, got: &[(i64, Vec<Option<i64>>)], plan: &str| {
         assert_eq!(got.len(), left.len(), "{name} {c:?}");
@@ -413,10 +393,10 @@ async fn errors() {
     let c = base(40);
     let mut rng = Rng(9);
     let rows = gen_rows(&mut rng, 50, 3, &c, 0);
-    write_parquet(&dir.path().join("left.parquet"), &c, &rows, "lpx");
-    write_parquet(&dir.path().join("right.parquet"), &c, &rows, "rid");
+    write_case_file(&dir.path().join("left.parquet"), &c, &rows, "lpx");
+    write_case_file(&dir.path().join("right.parquet"), &c, &rows, "rid");
     let us = Case { unit: TimeUnit::Microsecond, ..base(41) };
-    write_parquet(&dir.path().join("right_us.parquet"), &us, &rows, "rid");
+    write_case_file(&dir.path().join("right_us.parquet"), &us, &rows, "rid");
     let ctx = context();
     let l = ctx.read_parquet(dir.path().join("left.parquet").to_str().unwrap(), ParquetReadOptions::default()).await.unwrap();
     let r = ctx.read_parquet(dir.path().join("right.parquet").to_str().unwrap(), ParquetReadOptions::default()).await.unwrap();
@@ -425,13 +405,11 @@ async fn errors() {
     let rp = r.create_physical_plan().await.unwrap();
     let rp_us = r_us.create_physical_plan().await.unwrap();
     let cfg = ctx.state().config_options().clone();
-    let err = |n: JoinAsofMarkouts, r: &Arc<dyn ExecutionPlan>| {
-        n.build(Arc::clone(&lp), Arc::clone(r), None, &cfg).unwrap_err().to_string()
-    };
+    let err = |n: JoinAsof, r: &Arc<dyn ExecutionPlan>| n.build(Arc::clone(&lp), Arc::clone(r), &cfg).unwrap_err().to_string();
     let m = |v: &[&str]| v.iter().map(|s| Markout::parse(s).unwrap()).collect::<Vec<_>>();
-    assert!(err(JoinAsofMarkouts::new("id", m(&["1"])), &rp).contains("must be a Timestamp"));
-    assert!(err(JoinAsofMarkouts::new("ts", m(&["1"])), &rp_us).contains("same type"));
-    assert!(err(JoinAsofMarkouts::new("ts", m(&["0.0005"])), &rp).contains("not a whole number"));
-    assert!(err(JoinAsofMarkouts::new("ts", m(&["1", "1.0"])), &rp).contains("duplicate markout 1"));
-    assert!(err(JoinAsofMarkouts::new("ts", m(&[])), &rp).contains("at least one"));
+    assert!(err(JoinAsof::new("id").markouts(m(&["1"])), &rp).contains("must be a Timestamp"));
+    assert!(err(JoinAsof::new("ts").markouts(m(&["1"])), &rp_us).contains("same type"));
+    assert!(err(JoinAsof::new("ts").markouts(m(&["0.0005"])), &rp).contains("not a whole number"));
+    assert!(err(JoinAsof::new("ts").markouts(m(&["1", "1.0"])), &rp).contains("duplicate markout 1"));
+    assert!(err(JoinAsof::new("ts").markouts(m(&[])), &rp).contains("at least one"));
 }

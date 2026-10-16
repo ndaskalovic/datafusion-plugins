@@ -5,7 +5,8 @@
 //! assumed order, an order DataFusion has to sort for, round-robin
 //! repartitioned and unioned inputs) and the serialized-plan provider.
 
-use std::fs::File;
+mod common;
+
 use std::sync::Arc;
 
 use arrow::array::{
@@ -14,13 +15,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::catalog::TableProvider;
-use datafusion::parquet::arrow::ArrowWriter;
-use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect, displayable};
-use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, col};
-use datafusion_plugins::{JoinAsof, PlanBytesTable};
+use datafusion::prelude::{ParquetReadOptions, SessionContext, col};
+use datafusion_plugins::{JoinAsof, NodeTable, PlanInputs};
+
+use common::{Rng, write_parquet};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum By {
@@ -53,19 +54,6 @@ struct Case {
     null_per_mille: u64,
     strict: bool,
     row_group: usize,
-}
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -149,7 +137,7 @@ fn ts_type(ts: Ts) -> DataType {
     }
 }
 
-fn write_parquet(path: &std::path::Path, c: &Case, rows: &[Row], payload_name: &str) {
+fn write_case_file(path: &std::path::Path, c: &Case, rows: &[Row], payload_name: &str) {
     let mut fields = vec![Field::new("id", DataType::Int64, false)];
     let mut cols: Vec<ArrayRef> =
         vec![Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.id)))];
@@ -162,14 +150,8 @@ fn write_parquet(path: &std::path::Path, c: &Case, rows: &[Row], payload_name: &
     // payload: identifies the row
     fields.push(Field::new(payload_name, DataType::Float64, false));
     cols.push(Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.id as f64))));
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), cols).unwrap();
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(c.row_group))
-        .build();
-    let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+    write_parquet(path, &batch, c.row_group);
 }
 
 /// Brute force: last right row (file order) of the same group with the
@@ -203,12 +185,7 @@ fn reference(c: &Case, left: &[Row], right: &[Row]) -> Vec<(i64, Option<i64>)> {
 
 fn context() -> SessionContext {
     // Tiny files: force byte-range splitting and many small batches.
-    let config = SessionConfig::new()
-        .with_target_partitions(4)
-        .with_batch_size(64)
-        .set_usize("datafusion.optimizer.repartition_file_min_size", 1)
-        .set_bool("datafusion.execution.enable_file_stream_work_stealing", false);
-    SessionContext::new_with_config(config)
+    common::context(4, 64)
 }
 
 type Rows = Vec<(i64, Option<i64>)>;
@@ -319,7 +296,8 @@ async fn run_plan_bytes(c: &Case, dir: &std::path::Path) -> (Rows, String) {
     let r = read(&ctx, c, &dir.join("right.parquet"), true).await;
     let lb = datafusion_proto::bytes::logical_plan_to_bytes(l.logical_plan()).unwrap();
     let rb = datafusion_proto::bytes::logical_plan_to_bytes(r.logical_plan()).unwrap();
-    let table = PlanBytesTable::try_new(vec![lb.to_vec(), rb.to_vec()], Arc::new(join(c)), None).unwrap();
+    let inputs = PlanInputs::try_new(vec![lb.to_vec(), rb.to_vec()]).unwrap();
+    let table = NodeTable::try_new(Arc::new(inputs), Arc::new(join(c))).unwrap();
     let schema = table.schema();
     let proj = vec![schema.index_of("id").unwrap(), schema.index_of("rid").unwrap()];
     let plan = table.plan(ctx.state().config_options(), Some(&proj)).await.unwrap();
@@ -333,8 +311,8 @@ fn write_case(c: &Case, dir: &std::path::Path) -> (Vec<Row>, Vec<Row>) {
     let mut right = gen_rows(&mut rng, c.n_right, c.right_groups, c, 1_000_000);
     sort_rows(&mut left, c.by);
     sort_rows(&mut right, c.by);
-    write_parquet(&dir.join("left.parquet"), c, &left, "lpx");
-    write_parquet(&dir.join("right.parquet"), c, &right, "rid");
+    write_case_file(&dir.join("left.parquet"), c, &left, "lpx");
+    write_case_file(&dir.join("right.parquet"), c, &right, "rid");
     (left, right)
 }
 
@@ -450,7 +428,7 @@ async fn unsorted_input_is_an_error() {
     // Swap two far-apart valid rows: unsorted, not visible at boundaries only.
     let n = left.len();
     left.swap(n / 3, 2 * n / 3);
-    write_parquet(&dir.path().join("left.parquet"), &c, &left, "lpx");
+    write_case_file(&dir.path().join("left.parquet"), &c, &left, "lpx");
     let _ = right;
     let err = run_builder(&c, dir.path(), Input::Assumed).await.unwrap_err();
     assert!(err.contains("left input is not sorted by (g, ts)"), "{err}");

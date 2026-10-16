@@ -2,8 +2,10 @@
 //!
 //! Every partition is executed exactly once, concurrently, by a producer task
 //! that prepares its batches (evaluates sort keys, optionally checks the
-//! order) and sends them over a bounded channel. The merge then emits one
-//! ordered stream:
+//! order) and sends them over a channel, then an explicit end marker: a
+//! partition that stops without one (a panic, a cancelled task) fails the
+//! merge instead of looking finished. The merge then emits one ordered
+//! stream:
 //!
 //! * **batch fast path**: when the stream with the smallest head can run past
 //!   every other stream's head, the run is found with one comparison (the
@@ -15,35 +17,39 @@
 //! Disjoint ranges (a sorted file split into byte ranges) therefore cost one
 //! comparison per batch. Overlapping streams (round-robin, unions) advance
 //! together. With disjoint ranges the merge drains one range at a time, so
-//! later ranges only run ahead as far as their buffers: two batches each,
-//! plus read-ahead from the memory pool for the nearest partitions still
-//! producing. That read-ahead starts small and grows only while the merge is
-//! starved (see `Budget`), up to a ceiling scaled to the machine and the
-//! input; a memory-limited pool caps it further.
+//! later ranges only run ahead as far as their buffers allow.
+//!
+//! Memory: every batch a partition holds (queued or being merged) is
+//! reserved from the memory pool. A partition holding nothing always gets
+//! its next batch (the merge needs a head from every partition); up to
+//! [`FREE`] batches double-buffer if `try_grow` allows; more is read-ahead
+//! (see [`Budget`]). A failed `try_grow` makes the partition wait, never
+//! fail.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arrow::array::RecordBatch;
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Result, exec_err, plan_err};
+use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::{LexOrdering, PhysicalExpr};
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::physical_expr::{LexOrdering, OrderingRequirements, PhysicalExpr};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
 };
-use futures::StreamExt;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
-use tokio::sync::mpsc;
+use futures::{FutureExt, StreamExt};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::kernel::gallop_by;
 
@@ -54,6 +60,11 @@ pub(crate) trait MergeKeys: Send + Sync + 'static {
     /// True if the keys are non-decreasing.
     fn is_sorted(&self) -> bool {
         (1..self.len()).all(|i| self.cmp_at(i - 1, self, i) != Ordering::Greater)
+    }
+    /// The first and last rows the order check compares across batch
+    /// boundaries (`None`: no row takes part).
+    fn bounds(&self) -> Option<(usize, usize)> {
+        self.len().checked_sub(1).map(|last| (0, last))
     }
 }
 
@@ -92,18 +103,18 @@ pub(crate) struct OrderCheck {
     pub hint: String,
 }
 
-/// Batches each partition may queue regardless of the budget, so the stream
-/// the merge is waiting on never blocks on it.
-const FREE: usize = 2;
+/// Batches a partition may hold (queued or being merged) outside the
+/// read-ahead budget.
+const FREE: usize = 3;
 
-/// Read-ahead memory of one merged input, beyond `FREE` batches per
-/// partition. It comes from the memory pool (a failed `try_grow` makes the
-/// partition wait, never fail), and its target is set by feedback: it starts
-/// at a few batches per window partition and doubles only while the merge
-/// is starved, i.e. waits on a partition while partitions in the window wait
-/// on budget, so more read-ahead would buy parallelism. Growth stops at the
-/// ceiling (see [`ceiling`]).
+/// Read-ahead memory of one merged input, beyond [`FREE`] batches per
+/// partition. It comes from the memory pool, and its target is set by
+/// feedback: it starts at a few batches per window partition and doubles
+/// only while the merge is starved, i.e. waits on a partition while
+/// partitions in the window wait on budget, so more read-ahead would buy
+/// parallelism. Growth stops at the ceiling (see [`ceiling`]).
 struct Budget {
+    /// Everything the input's partitions hold.
     res: MemoryReservation,
     /// Read-ahead bytes queued beyond the free slots...
     extra: AtomicUsize,
@@ -111,11 +122,9 @@ struct Budget {
     target: AtomicUsize,
     ceiling: usize,
     window: usize,
-    /// Window partitions waiting for budget.
-    blocked: AtomicUsize,
-    /// Wakes them when the target grows or budget is freed.
-    notify: tokio::sync::Notify,
-    peak: AtomicUsize,
+    /// Partitions waiting for read-ahead budget.
+    blocked: Mutex<BTreeSet<usize>>,
+    queues: Vec<Arc<Queue>>,
 }
 
 impl Budget {
@@ -129,17 +138,34 @@ impl Budget {
             return false;
         }
         self.extra.fetch_add(size, SeqCst);
-        self.peak.fetch_max(self.res.size(), SeqCst);
         true
     }
 
-    /// The merge is waiting: if window partitions wait on budget, grow.
+    fn blocked(&self) -> MutexGuard<'_, BTreeSet<usize>> {
+        self.blocked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `size` bytes of read-ahead were consumed: wake the nearest blocked
+    /// partition (the one the merge needs soonest).
+    fn release(&self, size: usize) {
+        self.extra.fetch_sub(size, SeqCst);
+        if let Some(&q) = self.blocked().first() {
+            self.queues[q].notify.notify_one();
+        }
+    }
+
+    /// The merge is waiting: if partitions wait on budget, grow and wake
+    /// them.
     fn starved(&self) {
-        if self.blocked.load(SeqCst) > 0 {
-            let t = self.target.load(SeqCst);
-            let grown = t.saturating_mul(2).min(self.ceiling);
-            if grown > t && self.target.compare_exchange(t, grown, SeqCst, SeqCst).is_ok() {
-                self.notify.notify_waiters();
+        let blocked = self.blocked();
+        if blocked.is_empty() {
+            return;
+        }
+        let t = self.target.load(SeqCst);
+        let grown = t.saturating_mul(2).min(self.ceiling);
+        if grown > t && self.target.compare_exchange(t, grown, SeqCst, SeqCst).is_ok() {
+            for &q in blocked.iter() {
+                self.queues[q].notify.notify_one();
             }
         }
     }
@@ -147,17 +173,17 @@ impl Budget {
 
 /// Physical memory of the machine, if known.
 fn physical_memory() -> Option<usize> {
+    // SAFETY: `sysconf` only reads system configuration values.
     let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
     (pages > 0 && size > 0).then(|| pages as usize * size as usize)
 }
 
 /// Ceiling of one input's read-ahead: an eighth of physical memory (so the
-/// two inputs of a node stay under a quarter), and no more than `window`
-/// partitions' worth of the input's estimated size: only that many read
-/// ahead at a time, so buffering more buys nothing. A memory-limited pool
-/// caps it further through `try_grow`; `DATAFUSION_PLUGINS_READAHEAD_MB` is
-/// an optional hard cap.
-fn ceiling(plan: &Arc<dyn ExecutionPlan>, window: usize) -> usize {
+/// two inputs of a node stay under a quarter, even with an unbounded pool),
+/// no more than `window` partitions' worth of the input's estimated size
+/// (only that many read ahead at a time, so buffering more buys nothing),
+/// and `cap`. A memory-limited pool caps it further through `try_grow`.
+fn ceiling(plan: &Arc<dyn ExecutionPlan>, window: usize, cap: usize) -> usize {
     let ram = physical_memory().map_or(1 << 30, |m| m / 8);
     let stats = datafusion::physical_plan::StatisticsContext::new()
         .compute(plan.as_ref(), &datafusion::physical_plan::StatisticsArgs::new());
@@ -169,30 +195,31 @@ fn ceiling(plan: &Arc<dyn ExecutionPlan>, window: usize) -> usize {
             let n = plan.output_partitioning().partition_count().max(1);
             b / n * window.min(n)
         });
-    let cap = std::env::var("DATAFUSION_PLUGINS_READAHEAD_MB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map_or(usize::MAX, |mb| (mb * 1024.0 * 1024.0) as usize);
     ram.min(input).min(cap).max(1)
 }
 
-/// A batch, its size in bytes, and whether it holds read-ahead budget.
-type Item<K> = (Result<Prepared<K>>, usize, bool);
+/// What a producer sends.
+enum Msg<K> {
+    /// A batch, its size in bytes, and whether it holds read-ahead budget.
+    Batch(Prepared<K>, usize, bool),
+    Failed(DataFusionError),
+    End,
+}
 
-/// What a partition has queued, shared by its producer and the merge.
+/// What a partition holds, shared by its producer and the merge.
 #[derive(Default)]
 struct Queue {
-    batches: std::sync::atomic::AtomicUsize,
-    bytes: std::sync::atomic::AtomicUsize,
-    /// Wakes the producer when the merge takes a batch.
-    notify: tokio::sync::Notify,
+    /// Batches queued or being merged.
+    held: AtomicUsize,
+    /// Wakes the producer: the merge took a batch, or budget was freed.
+    notify: Notify,
 }
 
 struct Input<K> {
-    rx: mpsc::UnboundedReceiver<Item<K>>,
+    rx: mpsc::UnboundedReceiver<Msg<K>>,
     queue: Arc<Queue>,
-    budget: Arc<Budget>,
-    cur: Option<(Prepared<K>, usize)>,
+    /// The batch being merged, the position in it, and its size.
+    cur: Option<(Prepared<K>, usize, usize)>,
     done: bool,
 }
 
@@ -200,167 +227,155 @@ struct Input<K> {
 pub(crate) struct MergedStream<K: MergeKeys> {
     inputs: Vec<Input<K>>,
     batch_size: usize,
-    _tasks: tokio::task::JoinSet<()>,
     budget: Arc<Budget>,
+    _tasks: tokio::task::JoinSet<()>,
 }
 
 /// Execute every partition of `plan` once and merge them in key order.
+/// `cap` bounds the read-ahead (bytes).
 pub(crate) fn merged<K: MergeKeys>(
     plan: &Arc<dyn ExecutionPlan>,
     ctx: &Arc<TaskContext>,
     prep: Prep<K>,
     check: OrderCheck,
+    cap: usize,
 ) -> Result<MergedStream<K>> {
     let n = plan.output_partitioning().partition_count();
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut inputs = Vec::with_capacity(n);
     // A partition reads ahead on the budget while fewer than `window`
     // lower-indexed partitions are still producing: with disjoint ranges that
     // keeps `window` ranges decoding, nearest first, while the merge drains
     // the ones before. Twice the threads, so I/O waits don't idle the CPU.
     let window = 2 * ctx.session_config().target_partitions().max(1);
+    let queues: Vec<Arc<Queue>> = (0..n).map(|_| Arc::default()).collect();
     let budget = Arc::new(Budget {
-        res: MemoryConsumer::new("AsofMerge read-ahead").register(ctx.memory_pool()),
+        res: MemoryConsumer::new("SortedMerge").register(ctx.memory_pool()),
         extra: AtomicUsize::new(0),
         target: AtomicUsize::new(0),
-        ceiling: ceiling(plan, window),
+        ceiling: ceiling(plan, window, cap),
         window,
-        blocked: AtomicUsize::new(0),
-        notify: tokio::sync::Notify::new(),
-        peak: AtomicUsize::new(0),
+        blocked: Mutex::default(),
+        queues: queues.clone(),
     });
-    let finished: Arc<Vec<std::sync::atomic::AtomicBool>> =
-        Arc::new((0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
-    let (done_tx, done_rx) = tokio::sync::watch::channel(0usize);
+    let finished: Arc<Vec<AtomicBool>> = Arc::new((0..n).map(|_| AtomicBool::new(false)).collect());
+    let (done_tx, done_rx) = watch::channel(0usize);
     let done_tx = Arc::new(done_tx);
-    for q in 0..n {
-        let (tx, rx) = mpsc::unbounded_channel::<Item<K>>();
-        let queue = Arc::new(Queue::default());
-        let (queue_p, budget_p) = (Arc::clone(&queue), Arc::clone(&budget));
-        let mut done_p = done_rx.clone();
-        let (finished_p, done_tx_p) = (Arc::clone(&finished), Arc::clone(&done_tx));
-        let mut stream = plan.execute(q, Arc::clone(ctx))?;
-        let (prep, check) = (Arc::clone(&prep), check.clone());
-        tasks.spawn(async move {
-            // Marks this producer finished (on any exit) and wakes the others.
-            struct Finish(Arc<Vec<std::sync::atomic::AtomicBool>>, usize, Arc<tokio::sync::watch::Sender<usize>>);
-            impl Drop for Finish {
-                fn drop(&mut self) {
-                    self.0[self.1].store(true, std::sync::atomic::Ordering::SeqCst);
-                    self.2.send_modify(|v| *v += 1);
-                }
-            }
-            let _finish = Finish(Arc::clone(&finished_p), q, done_tx_p);
-            let mut last: Option<(Arc<K>, usize)> = None;
-            let trace = std::env::var_os("DATAFUSION_PLUGINS_TRACE").is_some();
-            let (t0, mut t_dec, mut t_wait, mut nb) = (std::time::Instant::now(), 0f64, 0f64, 0usize);
-            let mut t = std::time::Instant::now();
-            while let Some(b) = stream.next().await {
-                t_dec += t.elapsed().as_secs_f64();
-                nb += 1;
-                let item = b.and_then(|b| prep(b)).and_then(|p| match p {
-                    Some(p) if p.keys.len() > 0 => {
-                        let k = &p.keys;
-                        if let Some((lk, li)) = &last
-                            && lk.cmp_at(*li, k, 0) == Ordering::Greater
-                        {
-                            return exec_err!(
-                                "{} (a batch starts before the previous one ended){}",
-                                check.message,
-                                check.hint
-                            );
-                        }
-                        if check.in_batch && !k.is_sorted() {
-                            return exec_err!("{}{}", check.message, check.hint);
-                        }
-                        last = Some((Arc::clone(k), k.len() - 1));
-                        Ok(Some(p))
-                    }
-                    _ => Ok(None),
-                });
-                let item = match item {
-                    Ok(None) => continue,
-                    Ok(Some(p)) => Ok(p),
-                    Err(e) => Err(e),
-                };
-                let failed = item.is_err();
-                let size = item.as_ref().map(|p| p.batch.get_array_memory_size()).unwrap_or(0);
-                let tw = std::time::Instant::now();
-                t_wait -= tw.duration_since(t).as_secs_f64(); // (prep counted as decode)
-                t_dec += tw.duration_since(t).as_secs_f64();
-                t = tw;
-                // A free slot (always accounted, never refused), or read-ahead
-                // budget while in the window. The merge frees slots of the
-                // stream it is waiting on, so that stream never waits on the
-                // others.
-                let extra = loop {
-                    if queue_p.batches.load(SeqCst) < FREE {
-                        budget_p.res.grow(size);
-                        break false;
-                    }
-                    let in_window = finished_p[..q].iter().filter(|f| !f.load(SeqCst)).count() < window;
-                    let more = budget_p.notify.notified();
-                    tokio::pin!(more);
-                    more.as_mut().enable();
-                    if in_window && budget_p.take(size) {
-                        break true;
-                    }
-                    if in_window {
-                        budget_p.blocked.fetch_add(1, SeqCst);
-                    }
-                    let stop = tokio::select! {
-                        _ = queue_p.notify.notified() => false,
-                        _ = &mut more, if in_window => false,
-                        r = done_p.changed() => r.is_err(),
-                    };
-                    if in_window {
-                        budget_p.blocked.fetch_sub(1, SeqCst);
-                    }
-                    if stop {
-                        return;
-                    }
-                };
-                queue_p.batches.fetch_add(1, SeqCst);
-                queue_p.bytes.fetch_add(size, SeqCst);
-                if tx.send((item, size, extra)).is_err() || failed {
-                    return;
-                }
-                t_wait += t.elapsed().as_secs_f64();
-                t = std::time::Instant::now();
-            }
-            if trace {
-                eprintln!(
-                    "[merge] partition {q:>3}: {nb:>5} batches, decode {t_dec:.3}s, wait {t_wait:.3}s, done at {:.3}s",
-                    t0.elapsed().as_secs_f64()
-                );
-            }
-        });
-        inputs.push(Input {
-            rx,
-            queue,
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut inputs = Vec::with_capacity(n);
+    for (q, queue) in queues.into_iter().enumerate() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let p = Producer {
+            q,
+            queue: Arc::clone(&queue),
             budget: Arc::clone(&budget),
-            cur: None,
-            done: false,
+            finished: Arc::clone(&finished),
+            done: done_rx.clone(),
+            prep: Arc::clone(&prep),
+            check: check.clone(),
+        };
+        let stream = plan.execute(q, Arc::clone(ctx))?;
+        let done_tx = Arc::clone(&done_tx);
+        tasks.spawn(async move {
+            let (finished, budget) = (Arc::clone(&p.finished), Arc::clone(&p.budget));
+            let msg = match AssertUnwindSafe(p.run(stream, &tx)).catch_unwind().await {
+                Ok(Ok(())) => Msg::End,
+                Ok(Err(e)) => Msg::Failed(e),
+                Err(panic) => {
+                    let what = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    Msg::Failed(exec_datafusion_err!("input partition {q} panicked: {what}"))
+                }
+            };
+            let _ = tx.send(msg);
+            finished[q].store(true, SeqCst);
+            budget.blocked().remove(&q);
+            done_tx.send_modify(|v| *v += 1);
         });
+        inputs.push(Input { rx, queue, cur: None, done: false });
     }
     Ok(MergedStream {
         inputs,
         batch_size: ctx.session_config().batch_size().max(1),
-        _tasks: tasks,
         budget,
+        _tasks: tasks,
     })
 }
 
-impl<K: MergeKeys> Drop for MergedStream<K> {
-    fn drop(&mut self) {
-        if std::env::var_os("DATAFUSION_PLUGINS_TRACE").is_some() {
-            let b = &self.budget;
-            eprintln!(
-                "[budget] peak reservation {:.1} MB, final target {:.1} MB, ceiling {:.1} MB",
-                b.peak.load(SeqCst) as f64 / 1048576.0,
-                b.target.load(SeqCst) as f64 / 1048576.0,
-                b.ceiling as f64 / 1048576.0
-            );
+/// One partition's producer.
+struct Producer<K> {
+    q: usize,
+    queue: Arc<Queue>,
+    budget: Arc<Budget>,
+    finished: Arc<Vec<AtomicBool>>,
+    /// Changes when a partition finishes (the window moves).
+    done: watch::Receiver<usize>,
+    prep: Prep<K>,
+    check: OrderCheck,
+}
+
+impl<K: MergeKeys> Producer<K> {
+    /// Prepare, check and send every batch (until the merge is gone).
+    async fn run(mut self, mut stream: SendableRecordBatchStream, tx: &mpsc::UnboundedSender<Msg<K>>) -> Result<()> {
+        let check = self.check.clone();
+        let mut last: Option<(Arc<K>, usize)> = None;
+        while let Some(b) = stream.next().await {
+            let Some(p) = (self.prep)(b?)? else { continue };
+            if let Some((first, end)) = p.keys.bounds() {
+                if let Some((lk, li)) = &last
+                    && lk.cmp_at(*li, &p.keys, first) == Ordering::Greater
+                {
+                    return exec_err!(
+                        "{} (a batch starts before the previous one ended){}",
+                        check.message,
+                        check.hint
+                    );
+                }
+                if check.in_batch && !p.keys.is_sorted() {
+                    return exec_err!("{}{}", check.message, check.hint);
+                }
+                last = Some((Arc::clone(&p.keys), end));
+            }
+            let size = p.batch.get_array_memory_size();
+            let extra = self.reserve(size).await?;
+            self.queue.held.fetch_add(1, SeqCst);
+            if tx.send(Msg::Batch(p, size, extra)).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserve `size` bytes for the next batch, waiting while that doesn't
+    /// fit; true if it is read-ahead budget.
+    async fn reserve(&mut self, size: usize) -> Result<bool> {
+        let (q, b) = (self.q, Arc::clone(&self.budget));
+        loop {
+            let held = self.queue.held.load(SeqCst);
+            if held == 0 {
+                // The merge needs a head from every partition: never wait.
+                b.res.grow(size);
+                return Ok(false);
+            }
+            let woken = self.queue.notify.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if held < FREE {
+                if b.res.try_grow(size).is_ok() {
+                    return Ok(false);
+                }
+            } else if self.finished[..q].iter().filter(|f| !f.load(SeqCst)).count() < b.window {
+                if b.take(size) {
+                    return Ok(true);
+                }
+                b.blocked().insert(q);
+            }
+            tokio::select! {
+                _ = &mut woken => {}
+                r = self.done.changed() => r.map_err(|_| exec_datafusion_err!("merge: producers gone"))?,
+            }
+            b.blocked().remove(&q);
         }
     }
 }
@@ -368,7 +383,7 @@ impl<K: MergeKeys> Drop for MergedStream<K> {
 impl<K: MergeKeys> MergedStream<K> {
     /// Head of input `s`: (keys, position).
     fn head(&self, s: usize) -> (&K, usize) {
-        let (p, pos) = self.inputs[s].cur.as_ref().expect("live input");
+        let (p, pos, _) = self.inputs[s].cur.as_ref().expect("live input");
         (&p.keys, *pos)
     }
 
@@ -382,40 +397,55 @@ impl<K: MergeKeys> MergedStream<K> {
         }
     }
 
+    /// Input `s` is done with its current batch: free it.
+    fn take_cur(&mut self, s: usize) -> Prepared<K> {
+        let inp = &mut self.inputs[s];
+        let (p, _, size) = inp.cur.take().expect("live input");
+        self.budget.res.shrink(size);
+        inp.queue.held.fetch_sub(1, SeqCst);
+        inp.queue.notify.notify_one();
+        p
+    }
+
+    /// Take a message from input `s`'s producer.
+    fn accept(&mut self, s: usize, msg: Option<Msg<K>>) -> Result<()> {
+        let inp = &mut self.inputs[s];
+        match msg {
+            Some(Msg::Batch(p, size, extra)) => {
+                if extra {
+                    self.budget.release(size);
+                }
+                inp.cur = Some((p, 0, size));
+            }
+            Some(Msg::End) => inp.done = true,
+            Some(Msg::Failed(e)) => return Err(e),
+            None => return internal_err!("input partition {s} stopped without finishing"),
+        }
+        Ok(())
+    }
+
     /// The next merged batch, or `None` at the end.
     pub(crate) async fn next(&mut self) -> Result<Option<Merged<K>>> {
-        for inp in self.inputs.iter_mut() {
-            while inp.cur.is_none() && !inp.done {
-                let got = match inp.rx.try_recv() {
-                    Ok(x) => Some(x),
+        for s in 0..self.inputs.len() {
+            while self.inputs[s].cur.is_none() && !self.inputs[s].done {
+                let inp = &mut self.inputs[s];
+                let msg = match inp.rx.try_recv() {
+                    Ok(m) => Some(m),
                     Err(mpsc::error::TryRecvError::Disconnected) => None,
                     Err(mpsc::error::TryRecvError::Empty) => {
                         // The merge has to wait for this partition.
-                        inp.budget.starved();
+                        self.budget.starved();
                         inp.rx.recv().await
                     }
                 };
-                match got {
-                    Some((item, size, extra)) => {
-                        inp.queue.batches.fetch_sub(1, SeqCst);
-                        inp.queue.bytes.fetch_sub(size, SeqCst);
-                        inp.budget.res.shrink(size);
-                        if extra {
-                            inp.budget.extra.fetch_sub(size, SeqCst);
-                            inp.budget.notify.notify_waiters();
-                        }
-                        inp.queue.notify.notify_one();
-                        inp.cur = Some((item?, 0));
-                    }
-                    None => inp.done = true,
-                }
+                self.accept(s, msg)?;
             }
         }
         let live: Vec<usize> = (0..self.inputs.len()).filter(|&s| self.inputs[s].cur.is_some()).collect();
         if live.is_empty() {
             return Ok(None);
         }
-        let mut segs: Vec<(usize, RecordBatch, usize, usize)> = Vec::new(); // (input, batch, start, len)
+        let mut segs: Vec<(RecordBatch, usize, usize)> = Vec::new(); // (batch, start, len)
         let mut total = 0usize;
         loop {
             // The input with the smallest head, and the runner-up.
@@ -443,18 +473,15 @@ impl<K: MergeKeys> MergedStream<K> {
                     if ok(n - 1) { n } else { gallop_by(n, pos, ok) }
                 }
             };
-            let (p, cur) = self.inputs[s].cur.as_mut().expect("live input");
-            segs.push((s, p.batch.clone(), pos, end - pos));
+            let (p, cur, _) = self.inputs[s].cur.as_mut().expect("live input");
+            segs.push((p.batch.clone(), pos, end - pos));
             total += end - pos;
             *cur = end;
             if end == n {
                 // Whole remaining batch: unchanged when it starts at row 0.
-                let (p, _) = self.inputs[s].cur.take().expect("live input");
+                let p = self.take_cur(s);
                 if segs.len() == 1 && pos == 0 {
-                    return Ok(Some(Merged {
-                        batch: p.batch,
-                        keys: Some(p.keys),
-                    }));
+                    return Ok(Some(Merged { batch: p.batch, keys: Some(p.keys) }));
                 }
                 break;
             }
@@ -462,54 +489,13 @@ impl<K: MergeKeys> MergedStream<K> {
                 break;
             }
         }
-        if let [(_, b, start, len)] = segs.as_slice() {
-            return Ok(Some(Merged {
-                batch: b.slice(*start, *len),
-                keys: None,
-            }));
+        if let [(b, start, len)] = segs.as_slice() {
+            return Ok(Some(Merged { batch: b.slice(*start, *len), keys: None }));
         }
-        let batches: Vec<&RecordBatch> = segs.iter().map(|s| &s.1).collect();
-        let idx: Vec<(usize, usize)> = segs
-            .iter()
-            .enumerate()
-            .flat_map(|(k, s)| (s.2..s.2 + s.3).map(move |r| (k, r)))
-            .collect();
-        Ok(Some(Merged {
-            batch: interleave_record_batch(&batches, &idx)?,
-            keys: None,
-        }))
-    }
-}
-
-/// Merge the (each sorted) partitions of an input into one ordered partition,
-/// like `SortPreservingMergeExec`, with the batch-level fast path above.
-#[derive(Debug)]
-pub struct SortedMergeExec {
-    input: Arc<dyn ExecutionPlan>,
-    ordering: LexOrdering,
-    cache: Arc<PlanProperties>,
-}
-
-impl SortedMergeExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, ordering: LexOrdering) -> Self {
-        let eq = input.equivalence_properties().clone();
-        let cache = PlanProperties::new(
-            eq,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            input,
-            ordering,
-            cache: Arc::new(cache),
-        }
-    }
-}
-
-impl DisplayAs for SortedMergeExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SortedMergeExec: [{}]", self.ordering)
+        let batches: Vec<&RecordBatch> = segs.iter().map(|s| &s.0).collect();
+        let idx: Vec<(usize, usize)> =
+            segs.iter().enumerate().flat_map(|(k, &(_, start, len))| (start..start + len).map(move |r| (k, r))).collect();
+        Ok(Some(Merged { batch: interleave_record_batch(&batches, &idx)?, keys: None }))
     }
 }
 
@@ -534,6 +520,43 @@ pub(crate) fn row_prep(ordering: &LexOrdering, schema: &SchemaRef) -> Result<Pre
     }))
 }
 
+/// Merge the (each sorted) partitions of an input into one ordered partition,
+/// like `SortPreservingMergeExec`, with the batch-level fast path above.
+#[derive(Debug)]
+pub struct SortedMergeExec {
+    input: Arc<dyn ExecutionPlan>,
+    ordering: LexOrdering,
+    read_ahead: usize,
+    cache: Arc<PlanProperties>,
+}
+
+impl SortedMergeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, ordering: LexOrdering) -> Self {
+        let mut eq = input.equivalence_properties().clone();
+        eq.clear_per_partition_constants();
+        eq.add_ordering(ordering.clone());
+        let cache = PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(1),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        );
+        Self { input, ordering, read_ahead: usize::MAX, cache: Arc::new(cache) }
+    }
+
+    /// Bound the read-ahead to `bytes` (default: see the module docs).
+    pub fn with_read_ahead_limit(mut self, bytes: usize) -> Self {
+        self.read_ahead = bytes;
+        self
+    }
+}
+
+impl DisplayAs for SortedMergeExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "SortedMergeExec: [{}]", self.ordering)
+    }
+}
+
 impl ExecutionPlan for SortedMergeExec {
     fn name(&self) -> &str {
         "SortedMergeExec"
@@ -541,6 +564,10 @@ impl ExecutionPlan for SortedMergeExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![Some(OrderingRequirements::from(self.ordering.clone()))]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -562,34 +589,16 @@ impl ExecutionPlan for SortedMergeExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-    fn replace_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-        _options: ReplaceChildrenOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return plan_err!("SortedMergeExec expects one child");
-        }
-        Ok(Arc::new(Self::new(children.swap_remove(0), self.ordering.clone())))
+    fn with_new_children(self: Arc<Self>, mut children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let (Some(input), true) = (children.pop(), children.is_empty()) else {
+            return internal_err!("SortedMergeExec expects one child");
+        };
+        Ok(Arc::new(Self::new(input, self.ordering.clone()).with_read_ahead_limit(self.read_ahead)))
     }
 
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.replace_children(
-            children,
-            ReplaceChildrenOptions::new(datafusion::physical_plan::ChildrenPropertiesMode::Recompute),
-        )
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
-            return exec_err!("SortedMergeExec has one partition");
+            return exec_err!("SortedMergeExec has one partition, got {partition}");
         }
         let prep = row_prep(&self.ordering, &self.input.schema())?;
         let check = OrderCheck {
@@ -597,7 +606,7 @@ impl ExecutionPlan for SortedMergeExec {
             in_batch: false,
             hint: String::new(),
         };
-        let mut m = merged(&self.input, &context, prep, check)?;
+        let mut m = merged(&self.input, &context, prep, check, self.read_ahead)?;
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 2);
         let tx = builder.tx();
         builder.spawn(async move {

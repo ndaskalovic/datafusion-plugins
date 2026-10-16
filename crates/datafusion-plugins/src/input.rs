@@ -4,33 +4,29 @@
 //! its own runtime, with everything it supports: in-memory tables, Python
 //! UDFs, object stores) and hands the node one stream per partition.
 //! [`HostInputExec`] exposes those streams as the partitions of a leaf
-//! plan; each is read exactly once, on a blocking thread. Their order is not
-//! visible here: it comes from the contract (each partition sorted), or the
-//! node sorts (when not `assume_sorted`).
+//! plan; each is opened and read exactly once, on a blocking thread (the
+//! host may block on its own runtime, or plan and run other nodes). Their
+//! order is not visible here: it comes from the contract (each partition
+//! sorted), or the node sorts (when not `assume_sorted`).
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DataFusionError, Result, exec_err, internal_datafusion_err, plan_err};
-use datafusion::datasource::TableType;
+use datafusion::common::{DataFusionError, Result, exec_err, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    ReplaceChildrenOptions, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
 };
 
-use crate::bridge::{BridgeExec, set_last_plan};
-use crate::plan_bytes::PlanNode;
+use crate::table::NodeInputs;
 
 /// A blocking reader of one partition's batches.
 pub type BatchReader = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
@@ -51,10 +47,51 @@ pub trait PreparedSource: fmt::Debug + Send + Sync + 'static {
     fn open(&self) -> Result<Vec<BatchReader>>;
 }
 
+/// [`PartitionSource`]s as the inputs of a [`crate::NodeTable`].
+#[derive(Debug)]
+pub struct HostInputs {
+    sources: Vec<Arc<dyn PartitionSource>>,
+    schemas: Vec<SchemaRef>,
+}
+
+impl HostInputs {
+    pub fn new(sources: Vec<Arc<dyn PartitionSource>>) -> Self {
+        let schemas = sources.iter().map(|s| s.schema()).collect();
+        Self { sources, schemas }
+    }
+}
+
+#[async_trait]
+impl NodeInputs for HostInputs {
+    fn schemas(&self) -> &[SchemaRef] {
+        &self.schemas
+    }
+
+    async fn plan(&self, _config: &ConfigOptions, columns: Vec<Option<Vec<String>>>) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        let (sources, schemas) = (self.sources.clone(), self.schemas.clone());
+        let prepared = tokio::task::spawn_blocking(move || {
+            sources
+                .iter()
+                .zip(schemas.iter().zip(columns))
+                .map(|(s, (schema, cols))| {
+                    let cols = cols.unwrap_or_else(|| schema.fields().iter().map(|f| f.name().clone()).collect());
+                    s.prepare(&cols)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        Ok(prepared.into_iter().map(|p| Arc::new(HostInputExec::new(p)) as Arc<dyn ExecutionPlan>).collect())
+    }
+}
+
+/// The partitions' readers once opened, or why opening failed.
+type Readers = Mutex<Option<std::result::Result<Vec<Option<BatchReader>>, Arc<DataFusionError>>>>;
+
 /// The partitions of a [`PreparedSource`] as a leaf plan.
-pub struct HostInputExec {
+pub(crate) struct HostInputExec {
     src: Arc<dyn PreparedSource>,
-    readers: Mutex<Option<Vec<Option<BatchReader>>>>,
+    readers: Arc<Readers>,
     cache: Arc<PlanProperties>,
 }
 
@@ -72,32 +109,35 @@ impl HostInputExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self {
-            src,
-            readers: Mutex::new(None),
-            cache: Arc::new(cache),
-        }
+        Self { src, readers: Arc::default(), cache: Arc::new(cache) }
     }
+}
 
-    /// Partition `i`'s reader; the first call opens every partition.
-    fn take(&self, i: usize) -> Result<Option<BatchReader>> {
-        let mut g = self.readers.lock().map_err(|_| internal_datafusion_err!("poisoned lock"))?;
-        if g.is_none() {
-            let rs = self.src.open()?;
-            let n = self.src.partition_count().max(1);
-            if rs.len() > n {
-                return exec_err!("input has {} partitions, expected {n}", rs.len());
-            }
-            *g = Some(rs.into_iter().map(Some).collect());
-        }
-        let slots = g.as_mut().expect("opened");
-        match slots.get_mut(i) {
-            Some(slot) => slot
-                .take()
-                .map(Some)
-                .ok_or_else(|| internal_datafusion_err!("input partition {i} executed twice")),
-            None => Ok(None), // fewer partitions than planned: this one is empty
-        }
+/// Partition `i`'s reader; the first call opens every partition. Blocking.
+fn take(src: &dyn PreparedSource, readers: &Readers, i: usize) -> Result<Option<BatchReader>> {
+    let mut g = readers.lock().unwrap_or_else(PoisonError::into_inner);
+    if g.is_none() {
+        let n = src.partition_count().max(1);
+        // Opened once: a failure is the answer for every partition.
+        let opened = src.open().and_then(|rs| match rs.len() > n {
+            true => exec_err!("HostInputExec: input has {} partitions, expected {n}", rs.len()),
+            false => Ok(rs.into_iter().map(Some).collect()),
+        });
+        *g = Some(opened.map_err(Arc::new));
+    }
+    let slots = match g.as_mut().expect("opened") {
+        Ok(slots) => slots,
+        Err(e) => return Err(DataFusionError::Shared(Arc::clone(e))),
+    };
+    match slots.get_mut(i) {
+        Some(slot) => match slot.take() {
+            Some(r) => Ok(Some(r)),
+            None => exec_err!(
+                "HostInputExec: partition {i} was already executed; a host input is a stream read once \
+                 (plan the query again to run it again)"
+            ),
+        },
+        None => Ok(None), // fewer partitions than planned: this one is empty
     }
 }
 
@@ -127,33 +167,19 @@ impl ExecutionPlan for HostInputExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-    fn replace_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-        _options: ReplaceChildrenOptions,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
-            return plan_err!("HostInputExec has no children");
+            return internal_err!("HostInputExec has no children");
         }
         Ok(self)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.replace_children(
-            children,
-            ReplaceChildrenOptions::new(datafusion::physical_plan::ChildrenPropertiesMode::Recompute),
-        )
     }
 
     fn execute(&self, partition: usize, _ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.src.schema(), 2);
         let tx = builder.tx();
-        let reader = self.take(partition)?;
+        let (src, readers) = (Arc::clone(&self.src), Arc::clone(&self.readers));
         builder.spawn_blocking(move || {
-            if let Some(reader) = reader {
+            if let Some(reader) = take(src.as_ref(), &readers, partition)? {
                 for b in reader {
                     let failed = b.is_err();
                     if tx.blocking_send(b).is_err() || failed {
@@ -164,105 +190,5 @@ impl ExecutionPlan for HostInputExec {
             Ok(())
         });
         Ok(builder.build())
-    }
-}
-
-/// A [`PlanNode`] over inputs another engine executes, as a table provider.
-#[derive(Debug, Clone)]
-pub struct StreamInputTable {
-    sources: Vec<Arc<dyn PartitionSource>>,
-    schemas: Vec<SchemaRef>,
-    node: Arc<dyn PlanNode>,
-    schema: SchemaRef,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl StreamInputTable {
-    pub fn try_new(
-        sources: Vec<Arc<dyn PartitionSource>>,
-        node: Arc<dyn PlanNode>,
-        runtime: Option<tokio::runtime::Handle>,
-    ) -> Result<Self> {
-        let schemas: Vec<SchemaRef> = sources.iter().map(|s| s.schema()).collect();
-        let schema = node.schema(&schemas)?;
-        Ok(Self {
-            sources,
-            schemas,
-            node,
-            schema,
-            runtime,
-        })
-    }
-
-    /// Prepare the inputs and build the node (blocking calls into the
-    /// sources happen on a blocking thread).
-    pub async fn plan(
-        &self,
-        config: &ConfigOptions,
-        projection: Option<&Vec<usize>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let all: Vec<usize> = (0..self.schema.fields().len()).collect();
-        let projection: Vec<usize> = projection.cloned().unwrap_or(all);
-        let needed = self.node.required_columns(&self.schemas, &projection)?;
-        let (sources, schemas) = (self.sources.clone(), self.schemas.clone());
-        let prepared = tokio::task::spawn_blocking(move || {
-            sources
-                .iter()
-                .zip(schemas.iter().zip(needed))
-                .map(|(s, (schema, cols))| {
-                    let cols = cols.unwrap_or_else(|| {
-                        schema.fields().iter().map(|f| f.name().clone()).collect()
-                    });
-                    s.prepare(&cols)
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))??;
-        let inputs: Vec<Arc<dyn ExecutionPlan>> = prepared
-            .into_iter()
-            .map(|p| Arc::new(HostInputExec::new(p)) as Arc<dyn ExecutionPlan>)
-            .collect();
-        let inner = self.node.build(&self.schemas, inputs, &projection, config)?;
-        set_last_plan(&inner);
-        Ok(Arc::new(BridgeExec::new(inner, self.runtime.clone())))
-    }
-}
-
-#[async_trait]
-impl TableProvider for StreamInputTable {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Unsupported; filters.len()])
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let config = state.config_options().clone();
-        let projection = projection.cloned();
-        match &self.runtime {
-            Some(rt) => {
-                let this = self.clone();
-                rt.spawn(async move { this.plan(&config, projection.as_ref()).await })
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-            }
-            None => self.plan(&config, projection.as_ref()).await,
-        }
     }
 }

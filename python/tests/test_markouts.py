@@ -10,22 +10,12 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
-from datafusion import SessionConfig, SessionContext, col, lit
+from datafusion import SessionContext, col, lit
 
 import datafusion_plugins as dp
 
 UNIT_PER_S = {"ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}
 
-
-def make_ctx() -> SessionContext:
-    config = (
-        SessionConfig()
-        .with_target_partitions(4)
-        .with_batch_size(64)
-        .set("datafusion.optimizer.repartition_file_min_size", "1")
-        .set("datafusion.execution.enable_file_stream_work_stealing", "false")
-    )
-    return SessionContext(config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,22 +122,21 @@ def case_id(c: Case) -> str:
 
 @pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
 @pytest.mark.parametrize("c", CASES, ids=case_id)
-def test_matches_polars(c: Case, declared: bool, tmp_path: Path) -> None:
+def test_matches_polars(c: Case, declared: bool, tmp_path: Path, ctx) -> None:
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     lf, rf = (read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)) if declared else (ctx.read_parquet(lp), ctx.read_parquet(rp))
-    got = run(c, ctx, lf, rf).to_polars()
-    plan = dp.last_plan()
+    out = run(c, ctx, lf, rf)
+    got = out.to_polars()
+    plan = dp.last_plan(out)
     assert "AsofExec" in plan and "SortExec" not in plan, plan
     want = polars_markouts(c, left, right)
     assert got.columns == want.columns
     assert got.equals(want), (got, want)
 
 
-def test_single_markout_equals_join_asof(tmp_path: Path) -> None:
+def test_single_markout_equals_join_asof(tmp_path: Path, ctx) -> None:
     c = Case(seed=20, markouts=(5,))
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     m = run(c, ctx, read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)).to_polars()
     shifted = ctx.read_parquet(lp, file_sort_order=[[col("g").sort(nulls_first=True), col("ts").sort(nulls_first=True)]])
     shifted = shifted.with_column("ts", col("ts") + lit(timedelta(seconds=5)))
@@ -156,25 +145,24 @@ def test_single_markout_equals_join_asof(tmp_path: Path) -> None:
     assert m["px_5s"].to_list() == a["px_right"].to_list()
 
 
-def test_headline_pipeline(tmp_path: Path) -> None:
+def test_headline_pipeline(tmp_path: Path, ctx) -> None:
     c = Case(seed=21, n_left=3000, n_right=8000, markouts=(1, 10, 60))
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     order = [[col("g").sort(), col("ts").sort()]]
     trades = ctx.read_parquet(lp, file_sort_order=order).filter(col("lpx") > lit(100.0))
     quotes = ctx.read_parquet(rp, file_sort_order=order)
-    got = dp.join_asof_markouts(trades, quotes, on="ts", markouts=[1, 10, 60], by="g", ctx=ctx).to_polars()
-    plan = dp.last_plan()
+    out = dp.join_asof_markouts(trades, quotes, on="ts", markouts=[1, 10, 60], by="g", ctx=ctx)
+    got = out.to_polars()
+    plan = dp.last_plan(out)
     assert "AsofExec" in plan and "SortExec" not in plan, plan
     assert "predicate=lpx@" in plan and "pruning_predicate" in plan, plan
     want = polars_markouts(c, left.filter(pl.col("lpx") > 100.0), right)
     assert got.equals(want)
 
 
-def test_errors(tmp_path: Path) -> None:
+def test_errors(tmp_path: Path, ctx) -> None:
     c = Case(seed=22)
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     lf, rf = read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)
     with pytest.raises(ValueError, match="must be a Timestamp"):
         dp.join_asof_markouts(lf, rf, on="id", markouts=[1], ctx=ctx)

@@ -8,7 +8,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::physical_expr::PhysicalExprRef;
 
-use crate::keys::{GroupKind, Keys, TsNative};
+use crate::keys::{GroupKind, Keys};
 
 /// Reference to a right row: `(source batch << 32) | row`. `NONE` = no match.
 pub const NONE: u64 = u64::MAX;
@@ -90,28 +90,21 @@ pub fn eval_side(
 }
 
 /// Extract keys of a left batch (nulls kept, flagged in `valid`).
-pub fn left_keys<TN: TsNative, G: GroupKind>(
-    g: &G,
-    ts_expr: &PhysicalExprRef,
-    by: &[PhysicalExprRef],
-    batch: &RecordBatch,
-) -> Result<Keys<TN, G>> {
+pub fn left_keys<G: GroupKind>(g: &G, ts_expr: &PhysicalExprRef, by: &[PhysicalExprRef], batch: &RecordBatch) -> Result<Keys<G>> {
     let (ts, by, valid) = eval_side(ts_expr, by, batch)?;
-    let (ts, grp, len) = (TN::extract(&ts)?, g.extract(&by)?, batch.num_rows());
-    let packed = g.pack(&grp, ts.as_slice(), len);
-    Ok(Keys { ts, grp, valid, len, packed })
+    Keys::new(g, &ts, &by, valid)
 }
 
 /// Extract keys of a right batch and keep the payload columns. Rows with a
 /// NULL ts or `by` key can never match, so they are filtered out here.
 /// Returns `None` for a batch with no usable rows.
-pub fn right_keys<TN: TsNative, G: GroupKind>(
+pub fn right_keys<G: GroupKind>(
     g: &G,
     ts_expr: &PhysicalExprRef,
     by: &[PhysicalExprRef],
     payload_idx: &[usize],
     batch: &RecordBatch,
-) -> Result<Option<(Keys<TN, G>, RecordBatch)>> {
+) -> Result<Option<(Keys<G>, RecordBatch)>> {
     if batch.num_rows() == 0 {
         return Ok(None);
     }
@@ -120,58 +113,54 @@ pub fn right_keys<TN: TsNative, G: GroupKind>(
     let (ts, by, payload) = match valid {
         Some(v) => {
             let mask = BooleanArray::new(v.inner().clone(), None);
-            let ts = filter(ts.as_ref(), &mask)?;
-            let by = by
-                .iter()
-                .map(|a| Ok(filter(a.as_ref(), &mask)?))
-                .collect::<Result<Vec<_>>>()?;
-            let payload = filter_record_batch(&payload, &mask)?;
-            (ts, by, payload)
+            let by = by.iter().map(|a| Ok(filter(a.as_ref(), &mask)?)).collect::<Result<Vec<_>>>()?;
+            (filter(ts.as_ref(), &mask)?, by, filter_record_batch(&payload, &mask)?)
         }
         None => (ts, by, payload),
     };
-    let len = ts.len();
-    if len == 0 {
+    if ts.is_empty() {
         return Ok(None);
     }
-    let (ts, grp) = (TN::extract(&ts)?, g.extract(&by)?);
-    let packed = g.pack(&grp, ts.as_slice(), len);
-    Ok(Some((Keys { ts, grp, valid: None, len, packed }, payload)))
+    Ok(Some((Keys::new(g, &ts, &by, None)?, payload)))
 }
 
-/// Column `j` of `batches` gathered by `refs` (`NONE` = null).
-pub fn take_refs(batches: &[&RecordBatch], j: usize, dt: &DataType, refs: &[u64]) -> Result<ArrayRef> {
-    let mut src: Option<usize> = None;
-    let mut single = true;
-    for r in refs.iter().filter(|r| **r != NONE) {
-        match src {
-            None => src = Some(ref_src(*r)),
-            Some(s) if s != ref_src(*r) => {
-                single = false;
-                break;
-            }
-            Some(_) => {}
+/// How to gather right rows `refs` (`NONE` = null) from the slices'
+/// batches: worked out once per offset, applied to every payload column.
+pub enum Gather {
+    Null(usize),
+    /// All matches in one batch.
+    Take(usize, UInt32Array),
+    /// `(batch + 1, row)`, batch 0 being a null.
+    Interleave(Vec<(usize, usize)>),
+}
+
+impl Gather {
+    pub fn new(refs: &[u64]) -> Self {
+        let mut srcs = refs.iter().filter(|r| **r != NONE).map(|r| ref_src(*r));
+        let Some(first) = srcs.next() else {
+            return Gather::Null(refs.len());
+        };
+        if srcs.all(|s| s == first) {
+            let idx = refs.iter().map(|r| (*r != NONE).then(|| ref_row(*r) as u32)).collect();
+            return Gather::Take(first, idx);
         }
+        Gather::Interleave(
+            refs.iter().map(|r| if *r == NONE { (0, 0) } else { (ref_src(*r) + 1, ref_row(*r)) }).collect(),
+        )
     }
-    match (src, single) {
-        (None, _) => Ok(new_null_array(dt, refs.len())),
-        (Some(s), true) => {
-            let idx: UInt32Array = refs
-                .iter()
-                .map(|r| (*r != NONE).then(|| ref_row(*r) as u32))
-                .collect();
-            Ok(take(batches[s].column(j).as_ref(), &idx, None)?)
-        }
-        _ => {
-            let null = new_null_array(dt, 1);
-            let mut arrs: Vec<&dyn Array> = vec![null.as_ref()];
-            arrs.extend(batches.iter().map(|b| b.column(j).as_ref()));
-            let idx: Vec<(usize, usize)> = refs
-                .iter()
-                .map(|r| if *r == NONE { (0, 0) } else { (ref_src(*r) + 1, ref_row(*r)) })
-                .collect();
-            Ok(interleave(&arrs, &idx)?)
-        }
+
+    /// Column `j` of `batches`, gathered.
+    pub fn column(&self, batches: &[&RecordBatch], j: usize, dt: &DataType) -> Result<ArrayRef> {
+        Ok(match self {
+            Gather::Null(n) => new_null_array(dt, *n),
+            Gather::Take(s, idx) => take(batches[*s].column(j).as_ref(), idx, None)?,
+            Gather::Interleave(idx) => {
+                let null = new_null_array(dt, 1);
+                let mut arrs: Vec<&dyn Array> = vec![null.as_ref()];
+                arrs.extend(batches.iter().map(|b| b.column(j).as_ref()));
+                interleave(&arrs, idx)?
+            }
+        })
     }
 }
 

@@ -23,18 +23,22 @@ datafusion-python's FFI layer.
 from __future__ import annotations
 
 import math
+import weakref
 from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any, Literal
 
 from datafusion import DataFrame, SessionContext
 
-import os
-
-from ._internal import PlanTable, StreamTable, __version__, ffi_version, set_memory_limit
-from ._internal import last_plan as _last_plan
+from ._internal import NodeTable, PlanRouteUnavailable, __version__, set_memory_limit
 
 __all__ = ["__version__", "join_asof", "join_asof_markouts", "last_plan", "set_memory_limit"]
+
+Route = Literal["auto", "plan", "stream"]
+
+# Each node result's table, and the latest one, for `last_plan`.
+_tables: weakref.WeakKeyDictionary[DataFrame, NodeTable] = weakref.WeakKeyDictionary()
+_latest: list[NodeTable] = []
 
 
 def _names(arg: str | Sequence[str] | None) -> list[str] | None:
@@ -67,12 +71,8 @@ def _by_args(
     return by_l, by_r
 
 
-def _route() -> str:
-    return os.environ.get("DATAFUSION_PLUGINS_ROUTE", "auto")
-
-
 def _node(
-    name: str, inputs: Sequence[DataFrame], args: dict[str, Any], ctx: SessionContext | None
+    name: str, inputs: Sequence[DataFrame], args: dict[str, Any], ctx: SessionContext | None, route: Route
 ) -> DataFrame:
     """Run node ``name`` over ``inputs`` and return the result as a DataFrame.
 
@@ -80,21 +80,29 @@ def _node(
     the plugin itself (its own parallel scans, pushdown and orderings);
     anything else (in-memory tables, Python UDFs, object stores, ...) is
     executed by datafusion-python and streamed to the plugin, partition by
-    partition. Both routes give the same results.
+    partition. Both routes give the same results; ``route`` forces one.
     """
     ctx = ctx if ctx is not None else SessionContext.global_ctx()
-    route = _route()
     table = None
-    if route in ("auto", "plan"):
+    if route != "stream":
         try:
             plans = [df.logical_plan().to_bytes(ctx) for df in inputs]
-            table = PlanTable(name, plans, args)
-        except Exception:
+        except Exception as e:  # not serializable (in-memory tables, Python UDFs, ...)
             if route == "plan":
-                raise
+                raise PlanRouteUnavailable(str(e)) from e
+            plans = None
+        if plans is not None:
+            try:
+                table = NodeTable.from_plans(name, plans, args)
+            except PlanRouteUnavailable:
+                if route == "plan":
+                    raise
     if table is None:
-        table = StreamTable(name, list(inputs), args)
-    return ctx.read_table(table)
+        table = NodeTable.from_frames(name, list(inputs), args)
+    out = ctx.read_table(table)
+    _tables[out] = table
+    _latest[:] = [table]
+    return out
 
 
 def join_asof(
@@ -113,6 +121,7 @@ def join_asof(
     assume_sorted: bool = False,
     check_sortedness: bool = True,
     ctx: SessionContext | None = None,
+    _route: Route = "auto",
 ) -> DataFrame:
     """ASOF join of two DataFrames, like polars ``DataFrame.join_asof``.
 
@@ -187,7 +196,7 @@ def join_asof(
         "assume_sorted": assume_sorted,
         "check_sortedness": check_sortedness,
     }
-    return _node("join_asof", [left, right], args, ctx)
+    return _node("join_asof", [left, right], args, ctx, _route)
 
 
 def _markout_str(h: object) -> str:
@@ -215,6 +224,7 @@ def join_asof_markouts(
     assume_sorted: bool = True,
     check_sortedness: bool = True,
     ctx: SessionContext | None = None,
+    _route: Route = "auto",
 ) -> DataFrame:
     """Backward ASOF joins at several time offsets, in one pass.
 
@@ -262,7 +272,8 @@ def join_asof_markouts(
     except ValueError as e:
         raise ValueError(f"join_asof_markouts: {e}") from None
     args = {
-        "on": on,
+        "left_on": on,
+        "right_on": on,
         "markouts": [_markout_str(h) for h in markouts],
         "by_left": by_l,
         "by_right": by_r,
@@ -270,30 +281,16 @@ def join_asof_markouts(
         "assume_sorted": assume_sorted,
         "check_sortedness": check_sortedness,
     }
-    return _node("join_asof_markouts", [left, right], args, ctx)
+    return _node("join_asof", [left, right], args, ctx, _route)
 
 
-def last_plan() -> str | None:
-    """The physical plan most recently built by a node in this process.
+def last_plan(df: DataFrame | None = None) -> str | None:
+    """The physical plan of node result ``df`` (default: of the latest node).
 
     Planning happens when a result is executed (``collect``, ``to_polars``,
-    ...) or explained. Use it to check whether a sort was added, which input
-    route ran (``HostInputExec`` = streamed from datafusion-python), and that
-    filters reached the scans.
+    ...) or explained; ``None`` until then. Use it to check whether a sort
+    was added, which input route ran (``HostInputExec`` = streamed from
+    datafusion-python), and that filters reached the scans.
     """
-    return _last_plan()
-
-
-def _check_version() -> None:
-    import datafusion
-
-    major = int(datafusion.__version__.split(".")[0])
-    if major != ffi_version():
-        msg = (
-            f"datafusion-plugins {__version__} was built for datafusion "
-            f"{ffi_version()}.*, but datafusion {datafusion.__version__} is installed"
-        )
-        raise ImportError(msg)
-
-
-_check_version()
+    table = _tables.get(df) if df is not None else (_latest[0] if _latest else None)
+    return table.last_plan() if table is not None else None

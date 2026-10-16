@@ -15,9 +15,7 @@ repository = "https://github.com/ndaskalovic/datafusion-plugins"
 datafusion = { version = "55.0.0" }
 datafusion-ffi = "55.0.0"
 datafusion-proto = { version = "55.0.0", default-features = false, features = ["parquet"] }
-arrow = { version = "59.2", features = ["prettyprint"] }
-parquet = { version = "59.2", default-features = false, features = ["arrow"] }
-object_store = { version = "0.13", default-features = false, features = ["fs"] }
+arrow = { version = "59.2" }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 futures = "0.3"
 libc = "0.2"

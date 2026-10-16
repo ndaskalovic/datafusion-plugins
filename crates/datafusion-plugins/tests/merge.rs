@@ -1,32 +1,26 @@
 //! `SortedMergeExec` (the merge inside the nodes) against a full sort, on
-//! disjoint, overlapping, single and empty partitions, with ties.
-//! (`merge_budget.rs` repeats some with a tiny read-ahead budget.)
+//! disjoint, overlapping, single and empty partitions, with ties; under
+//! memory-limited pools and a tiny read-ahead limit; and with a failing
+//! partition.
+
+mod common;
 
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::memory_pool::{
     FairSpillPool, GreedyMemoryPool, MemoryPool, PeakRecordingPool, UnboundedMemoryPool,
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::physical_plan::collect;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_plugins::SortedMergeExec;
 
-struct Rng(u64);
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % n.max(1)
-    }
-}
+use common::Rng;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -35,10 +29,10 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-/// Partitions of (k, id) rows, each sorted by k, as batches of `bs` rows.
-fn plan(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Arc<dyn ExecutionPlan> {
+/// Partitions of (k, id) rows as batches of `bs` rows.
+fn batches(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Vec<Vec<RecordBatch>> {
     let s = schema();
-    let data: Vec<Vec<RecordBatch>> = parts
+    parts
         .iter()
         .map(|p| {
             p.chunks(bs.max(1))
@@ -54,24 +48,24 @@ fn plan(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Arc<dyn ExecutionPlan> 
                 })
                 .collect()
         })
-        .collect();
-    MemorySourceConfig::try_new_exec(&data, s, None).unwrap()
+        .collect()
 }
 
 async fn merge(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Vec<(Option<i64>, i64)> {
-    merge_in(parts, bs, Arc::new(UnboundedMemoryPool::default())).await
+    merge_in(parts, bs, Arc::new(UnboundedMemoryPool::default()), usize::MAX).await
 }
 
-/// Merge with `pool` as the memory pool.
-async fn merge_in(parts: &[Vec<(Option<i64>, i64)>], bs: usize, pool: Arc<dyn MemoryPool>) -> Vec<(Option<i64>, i64)> {
-    let ord = LexOrdering::new(vec![PhysicalSortExpr {
-        expr: Arc::new(Column::new("k", 0)),
-        options: SortOptions { descending: false, nulls_first: true },
-    }])
-    .unwrap();
+/// Merge with `pool` as the memory pool and at most `read_ahead` bytes of
+/// read-ahead.
+async fn merge_in(
+    parts: &[Vec<(Option<i64>, i64)>],
+    bs: usize,
+    pool: Arc<dyn MemoryPool>,
+    read_ahead: usize,
+) -> Vec<(Option<i64>, i64)> {
     let runtime = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc().unwrap();
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_batch_size(16), runtime);
-    let m = Arc::new(SortedMergeExec::new(plan(parts, bs), ord));
+    let m = Arc::new(SortedMergeExec::new(common::mem(&schema(), batches(parts, bs)), ordering()).with_read_ahead_limit(read_ahead));
     let mut out = Vec::new();
     for b in collect(m, ctx.task_ctx()).await.unwrap() {
         let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -81,6 +75,11 @@ async fn merge_in(parts: &[Vec<(Option<i64>, i64)>], bs: usize, pool: Arc<dyn Me
         }
     }
     out
+}
+
+fn ordering() -> LexOrdering {
+    let options = SortOptions { descending: false, nulls_first: true };
+    LexOrdering::new(vec![PhysicalSortExpr { expr: Arc::new(Column::new("k", 0)), options }]).unwrap()
 }
 
 /// Expected: all rows sorted by k (nulls first); ties by partition, then
@@ -147,8 +146,8 @@ async fn memory_limited_pools() {
         let pools: [Arc<dyn MemoryPool>; 2] =
             [Arc::new(GreedyMemoryPool::new(limit)), Arc::new(FairSpillPool::new(limit))];
         for pool in pools {
-            assert_eq!(merge_in(&disjoint, 64, Arc::clone(&pool)).await, expected(&disjoint), "limit {limit}");
-            assert_eq!(merge_in(&overlap, 32, Arc::clone(&pool)).await, expected(&overlap), "limit {limit}");
+            assert_eq!(merge_in(&disjoint, 64, Arc::clone(&pool), usize::MAX).await, expected(&disjoint), "limit {limit}");
+            assert_eq!(merge_in(&overlap, 32, Arc::clone(&pool), usize::MAX).await, expected(&overlap), "limit {limit}");
             assert_eq!(pool.reserved(), 0, "limit {limit}: reservation not returned");
         }
     }
@@ -159,7 +158,41 @@ async fn reservation_grows_and_returns_to_zero() {
     let mut rng = Rng(19);
     let parts: Vec<_> = (0..5).map(|p| sorted_part(&mut rng, 5000, p * 100_000, 100_000, p * 100_000, false)).collect();
     let pool = Arc::new(PeakRecordingPool::new(Arc::new(UnboundedMemoryPool::default())));
-    assert_eq!(merge_in(&parts, 64, Arc::clone(&pool) as _).await, expected(&parts));
+    assert_eq!(merge_in(&parts, 64, Arc::clone(&pool) as _, usize::MAX).await, expected(&parts));
     assert!(pool.peak_reserved() > 0, "read-ahead was not accounted");
     assert_eq!(pool.reserved(), 0, "reservation not returned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tiny_read_ahead_limit() {
+    // ~2 KiB of read-ahead: later ranges fill it while the first one drains;
+    // the drained stream must still make progress (no deadlock), and under
+    // an unbounded pool the peak stays within the limit plus the free
+    // batches per partition.
+    let limit = 2048;
+    let mut rng = Rng(5);
+    let parts: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 3000, p * 100_000, 100_000, p * 100_000, false)).collect();
+    let pool = Arc::new(PeakRecordingPool::new(Arc::new(UnboundedMemoryPool::default())));
+    assert_eq!(merge_in(&parts, 64, Arc::clone(&pool) as _, limit).await, expected(&parts));
+    let one = 64 * 16 + 1024; // a 64-row (k, id) batch, with slack for buffers
+    let bound = limit + parts.len() * 3 * one;
+    assert!(pool.peak_reserved() <= bound, "peak {} > {bound}", pool.peak_reserved());
+    let parts: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 2000, 0, 500, p * 100_000, true)).collect();
+    assert_eq!(merge_in(&parts, 32, Arc::new(UnboundedMemoryPool::default()), limit).await, expected(&parts));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failing_partition_is_an_error() {
+    // A partition that panics or errors midway fails the merge (it used to
+    // end it early, silently dropping rows).
+    let mut rng = Rng(23);
+    let parts: Vec<_> = (0..3).map(|p| sorted_part(&mut rng, 200, p * 1000, 1000, p * 10_000, false)).collect();
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(16));
+    for error in [false, true] {
+        let input = common::failing(&schema(), batches(&parts, 16), Some((1, 3, error)));
+        let m = Arc::new(SortedMergeExec::new(input, ordering()));
+        let err = collect(m, ctx.task_ctx()).await.unwrap_err().to_string();
+        let want = if error { "upstream failed at batch 3" } else { "panicked: upstream panicked at batch 3" };
+        assert!(err.contains(want), "{err}");
+    }
 }

@@ -10,23 +10,11 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
-from datafusion import SessionConfig, SessionContext, col, lit
+from datafusion import SessionContext, col, lit
 from datafusion import functions as F
 
 import datafusion_plugins as dp
 
-
-def make_ctx(target_partitions: int = 4) -> SessionContext:
-    config = (
-        SessionConfig()
-        .with_target_partitions(target_partitions)
-        .with_batch_size(64)
-        .set("datafusion.optimizer.repartition_file_min_size", "1")
-        # Each scan partition one byte range read in order (no stealing), so
-        # a sorted file's partitions are each sorted for the host route too.
-        .set("datafusion.execution.enable_file_stream_work_stealing", "false")
-    )
-    return SessionContext(config)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,15 +164,15 @@ def run(c: Case, ctx: SessionContext, lf, rf, **kw):
 # rows may be reordered), or no order with assume_sorted (trusted, checked).
 @pytest.mark.parametrize("mode", ["declared", "sorted", "assumed"])
 @pytest.mark.parametrize("c", CASES, ids=case_id)
-def test_matches_polars(c: Case, mode: str, tmp_path: Path) -> None:
+def test_matches_polars(c: Case, mode: str, tmp_path: Path, ctx) -> None:
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     if mode == "declared":
         lf, rf = read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)
     else:
         lf, rf = ctx.read_parquet(lp), ctx.read_parquet(rp)
-    got = run(c, ctx, lf, rf, assume_sorted=mode == "assumed").select("id", "rid").to_polars()
-    plan = dp.last_plan()
+    out = run(c, ctx, lf, rf, assume_sorted=mode == "assumed")
+    got = out.select("id", "rid").to_polars()
+    plan = dp.last_plan(out)
     assert ("SortExec" in plan) == (mode == "sorted"), plan
     if mode == "sorted":
         want = dict(zip(left["id"].to_list(), reference(c, left, right)))
@@ -194,13 +182,12 @@ def test_matches_polars(c: Case, mode: str, tmp_path: Path) -> None:
         check_result(c, left, right, got)
 
 
-def test_headline_pipeline(tmp_path: Path) -> None:
+def test_headline_pipeline(tmp_path: Path, ctx) -> None:
     """read_parquet with a declared order -> filter -> with_column ->
     join_asof: no sort, range-parallel mode, filter pushed into the scan, and
     the result chains on."""
     c = Case(seed=50, n_left=3000, n_right=8000)
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     order = [[col("g").sort(), col("ts").sort()]]  # NULLS LAST is fine too
     trades = (
         ctx.read_parquet(lp, file_sort_order=order)
@@ -215,7 +202,7 @@ def test_headline_pipeline(tmp_path: Path) -> None:
         .sort(col("g").sort())
         .to_polars()
     )
-    plan = dp.last_plan()
+    plan = dp.last_plan(out)
     assert "SortExec" not in plan and "HostInputExec" not in plan, plan
     assert "predicate=lpx@" in plan and "pruning_predicate" in plan, plan
     lf = left.filter(pl.col("lpx") > 100.0).with_columns(notional=pl.col("lpx") * 2)
@@ -231,32 +218,30 @@ def test_headline_pipeline(tmp_path: Path) -> None:
     assert res.equals(want_agg.with_columns(pl.col("n").cast(res["n"].dtype)))
 
 
-def test_input_is_a_join(tmp_path: Path) -> None:
+def test_input_is_a_join(tmp_path: Path, ctx) -> None:
     c = Case(seed=52)
     left, right, lp, rp = write(c, tmp_path)
     dim = pl.DataFrame({"g": pl.Series(range(12), dtype=pl.Int32), "w": [float(i) for i in range(12)]})
     dp_path = str(tmp_path / "dim.parquet")
     dim.write_parquet(dp_path)
-    ctx = make_ctx()
     lf = read_sorted(ctx, lp, c).alias("t").join(
         ctx.read_parquet(dp_path).alias("d"), on="g", how="inner"
     )
     rf = read_sorted(ctx, rp, c)
     out = dp.join_asof(lf, rf, on="ts", by="g", ctx=ctx)
     got = out.select("id", "w", "rid").to_polars()
-    plan = dp.last_plan()
+    plan = dp.last_plan(out)
     assert "HashJoinExec" in plan, plan
     lj = left.join(dim, on="g", how="inner")
     want = polars_ref(c, lj, right).select("id", "w", "rid")
     assert got.sort("id").equals(want.sort("id"))
 
 
-def test_not_sorted_raises(tmp_path: Path) -> None:
+def test_not_sorted_raises(tmp_path: Path, ctx) -> None:
     c = Case(seed=54)
     left, right, lp, rp = write(c, tmp_path)
     shuffled = str(tmp_path / "left_shuffled.parquet")
     left.sample(fraction=1.0, shuffle=True, seed=2).write_parquet(shuffled, row_group_size=37)
-    ctx = make_ctx()
     out = dp.join_asof(ctx.read_parquet(shuffled), ctx.read_parquet(rp), on="ts", by="g", assume_sorted=True, ctx=ctx)
     with pytest.raises(Exception, match=r"left input is not sorted by \(g, ts\)"):
         out.collect()
@@ -269,10 +254,9 @@ def test_not_sorted_raises(tmp_path: Path) -> None:
         out.collect()
 
 
-def test_check_sortedness_false_trusts(tmp_path: Path) -> None:
+def test_check_sortedness_false_trusts(tmp_path: Path, ctx) -> None:
     c = Case(seed=55)
     left, right, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     out = dp.join_asof(
         ctx.read_parquet(lp), ctx.read_parquet(rp), on="ts", by="g",
         assume_sorted=True, check_sortedness=False, ctx=ctx,
@@ -291,7 +275,7 @@ SCHEMA_ARGS = [
 
 
 @pytest.mark.parametrize("kw", SCHEMA_ARGS, ids=lambda k: "-".join(f"{a}={b}" for a, b in k.items()))
-def test_schema_matches_polars(kw: dict, tmp_path: Path) -> None:
+def test_schema_matches_polars(kw: dict, tmp_path: Path, ctx) -> None:
     rename = "right_on" in kw
     left = pl.DataFrame(
         {"id": [1, 2, 3], "g": [1, 1, 2], "ts": [5, 9, 4], "x": [1.0, 2.0, 3.0], "y_right": [0, 0, 0],
@@ -310,13 +294,12 @@ def test_schema_matches_polars(kw: dict, tmp_path: Path) -> None:
     left.write_parquet(lp)
     right.write_parquet(rp)
     want = left.join_asof(right, strategy="backward", **kw)
-    ctx = make_ctx()
     got = dp.join_asof(ctx.read_parquet(lp), ctx.read_parquet(rp), ctx=ctx, **kw).to_polars()
     assert got.columns == want.columns
     assert got.equals(want), (got, want)
 
 
-def test_suffix_clash_raises(tmp_path: Path) -> None:
+def test_suffix_clash_raises(tmp_path: Path, ctx) -> None:
     left = pl.DataFrame({"ts": [1], "y": [0], "y_right": [3]})
     right = pl.DataFrame({"ts": [1], "y": [1]})
     with pytest.raises(Exception, match="already exists"):
@@ -324,15 +307,13 @@ def test_suffix_clash_raises(tmp_path: Path) -> None:
     lp, rp = str(tmp_path / "l.parquet"), str(tmp_path / "r.parquet")
     left.write_parquet(lp)
     right.write_parquet(rp)
-    ctx = make_ctx()
     with pytest.raises(ValueError, match="already exists"):
         dp.join_asof(ctx.read_parquet(lp), ctx.read_parquet(rp), on="ts", ctx=ctx)
 
 
-def test_argument_validation(tmp_path: Path) -> None:
+def test_argument_validation(tmp_path: Path, ctx) -> None:
     c = Case(seed=56)
     _, _, lp, rp = write(c, tmp_path)
-    ctx = make_ctx()
     lf, rf = read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)
     with pytest.raises(NotImplementedError):
         dp.join_asof(lf, rf, on="ts", strategy="forward", ctx=ctx)

@@ -3,20 +3,19 @@
 //!
 //! Nodes:
 //! * [`JoinAsof`]: streaming backward ASOF join with polars `join_asof`
-//!   semantics.
-//! * [`JoinAsofMarkouts`]: ASOF joins at several time offsets ("markouts")
-//!   in one pass over the right input.
+//!   semantics, optionally at several time offsets ("markouts") in one pass
+//!   over the right input.
 //!
-//! Both plug in after any upstream plan: each input partition is executed
+//! A node plugs in after any upstream plan: each input partition is executed
 //! once, the partitions are merged in key order ([`SortedMergeExec`] is the
 //! same merge as a standalone operator), and the order is either required
 //! (DataFusion sorts only where it can't prove it) or assumed and checked.
 //!
 //! Each node implements [`PlanNode`] (physical input plans in, physical plan
-//! out). [`StreamInputTable`] runs a node over inputs another engine executes
-//! (the Python package: datafusion-python DataFrames, read as Arrow
-//! streams); [`PlanBytesTable`] over serialized logical plans planned here.
-//! [`BridgeExec`] is the leaf a node's plan is handed out in.
+//! out). [`NodeTable`] runs a node as a table provider, over serialized
+//! logical plans planned here ([`PlanInputs`]) or inputs another engine
+//! executes ([`HostInputs`]: the Python package's datafusion-python
+//! DataFrames, read as Arrow streams).
 //!
 //! ```no_run
 //! # async fn example() -> datafusion::common::Result<()> {
@@ -40,20 +39,51 @@
 //! # Ok(()) }
 //! ```
 
+use std::fmt;
+use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef;
+use datafusion::common::Result;
+use datafusion::common::config::ConfigOptions;
+use datafusion::physical_plan::ExecutionPlan;
+
 mod asof;
 mod bridge;
 mod input;
 mod join_asof;
 mod kernel;
 mod keys;
-mod markouts;
 mod merge;
-mod plan_bytes;
+mod ordered;
+mod table;
 
-pub use asof::{AsofExec, AsofSpec};
-pub use bridge::{BridgeExec, last_plan, set_memory_pool};
-pub use input::{BatchReader, HostInputExec, PartitionSource, PreparedSource, StreamInputTable};
-pub use join_asof::{JoinAsof, OutputColumn, Side};
-pub use markouts::{JoinAsofMarkouts, Markout};
+pub use input::{BatchReader, HostInputs, PartitionSource, PreparedSource};
+pub use join_asof::{JoinAsof, Markout, OutputColumn, Side};
 pub use merge::SortedMergeExec;
-pub use plan_bytes::{PlanBytesTable, PlanNode};
+pub use table::{NodeInputs, NodeTable, PlanInputs};
+
+/// A node: N physical input plans in, one physical plan out.
+///
+/// Inputs arrive planned (filters and projections pushed into their scans)
+/// and pruned to [`PlanNode::required_columns`]; the node refers to their
+/// columns by name.
+pub trait PlanNode: fmt::Debug + Send + Sync + 'static {
+    /// The output schema for these input schemas; validate arguments here.
+    fn schema(&self, inputs: &[SchemaRef]) -> Result<SchemaRef>;
+
+    /// Columns each input must keep to produce the output columns
+    /// `projection` (indices into [`PlanNode::schema`]); `None` keeps all.
+    fn required_columns(&self, inputs: &[SchemaRef], _projection: &[usize]) -> Result<Vec<Option<Vec<String>>>> {
+        Ok(vec![None; inputs.len()])
+    }
+
+    /// The plan producing the output columns `projection`, in that order.
+    /// `schemas` are the full input schemas, `inputs` the pruned plans.
+    fn build(
+        &self,
+        schemas: &[SchemaRef],
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        projection: &[usize],
+        config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>>;
+}

@@ -1326,8 +1326,6 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "libc",
- "object_store",
- "parquet",
  "tempfile",
  "tokio",
 ]
@@ -1340,7 +1338,6 @@ dependencies = [
  "datafusion",
  "datafusion-ffi",
  "datafusion-plugins",
- "futures",
  "pyo3",
  "tokio",
 ]
