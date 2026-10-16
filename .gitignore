@@ -5,6 +5,5 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-/bench/data/
 *.parquet
 dist/
