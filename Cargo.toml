@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/datafusion-plugins", "python"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/ndaskalovic/datafusion-plugins"
+
+[workspace.dependencies]
+# DataFusion's FFI ABI is version-locked: the plugin must be built against the
+# same major version as the datafusion-python wheel that loads it (55).
+datafusion = { version = "55.0.0" }
+datafusion-ffi = "55.0.0"
+datafusion-proto = { version = "55.0.0", default-features = false, features = ["parquet"] }
+arrow = { version = "59.2", features = ["prettyprint"] }
+parquet = { version = "59.2", default-features = false, features = ["arrow"] }
+object_store = { version = "0.13", default-features = false, features = ["fs"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
+futures = "0.3"
+async-trait = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

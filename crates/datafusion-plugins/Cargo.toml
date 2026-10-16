@@ -1,0 +1,29 @@
+[package]
+name = "datafusion-plugins"
+description = "Streaming, range-parallel ASOF join operator for Apache DataFusion"
+readme = "../../README.md"
+keywords = ["datafusion", "asof", "join", "arrow", "parquet"]
+categories = ["database-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "datafusion_plugins"
+
+[dependencies]
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

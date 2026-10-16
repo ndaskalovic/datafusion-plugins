@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Core crate tests
+        run: cargo test -p datafusion-plugins
+      - name: Core crate tests (forced sparse-left fan-out)
+        run: cargo test -p datafusion-plugins --test compare
+        env:
+          FANOUT: "1"
+
+  python:
+    name: maturin + pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - name: Create venv
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python "datafusion==55.*" polars pyarrow pytest maturin numpy
+      - name: Build
+        run: |
+          source .venv/bin/activate
+          maturin develop --release
+      - name: Test
+        run: .venv/bin/python -m pytest -q

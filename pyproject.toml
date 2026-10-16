@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "datafusion-plugins"
+description = "Fast streaming ASOF join for datafusion-python (DataFusion FFI plugin)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+# The DataFusion FFI ABI is version-locked: this build only loads into
+# datafusion-python 55.x.
+dependencies = ["datafusion==55.*"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/ndaskalovic/datafusion-plugins"
+
+[project.optional-dependencies]
+test = ["pytest", "polars", "pyarrow", "numpy"]
+
+[tool.maturin]
+manifest-path = "python/Cargo.toml"
+python-source = "python"
+module-name = "datafusion_plugins._internal"
+include = [{ path = "python/datafusion_plugins/py.typed", format = ["sdist", "wheel"] }]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+filterwarnings = ["ignore:Sortedness of columns cannot be checked"]
