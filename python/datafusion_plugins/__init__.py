@@ -12,8 +12,9 @@ arguments, output columns and contract follow polars ``DataFrame.join_asof``:
   values and ``right.on <= left.on`` (``<`` with
   ``allow_exact_matches=False``); every left row appears once, in left order;
   right columns are null without a match;
-* inputs must already be sorted by ``(by..., on)`` (or ``on`` without
-  ``by``). Nothing is sorted for you: sort it yourself, as with polars.
+* inputs are sorted by ``(by..., on)`` (or ``on`` without ``by``): either
+  required (DataFusion sorts only what it can't prove sorted) or, with
+  ``assume_sorted``, trusted and checked while streaming.
 
 The operator is a native DataFusion ``ExecutionPlan`` loaded through
 datafusion-python's FFI layer.
@@ -28,7 +29,9 @@ from typing import Any, Literal
 
 from datafusion import DataFrame, SessionContext
 
-from ._internal import PlanTable, __version__, ffi_version
+import os
+
+from ._internal import PlanTable, StreamTable, __version__, ffi_version
 from ._internal import last_plan as _last_plan
 
 __all__ = ["__version__", "join_asof", "join_asof_markouts", "last_plan"]
@@ -64,22 +67,34 @@ def _by_args(
     return by_l, by_r
 
 
+def _route() -> str:
+    return os.environ.get("DATAFUSION_PLUGINS_ROUTE", "auto")
+
+
 def _node(
     name: str, inputs: Sequence[DataFrame], args: dict[str, Any], ctx: SessionContext | None
 ) -> DataFrame:
-    """Run node ``name`` over ``inputs``: their logical plans go to the plugin,
-    which plans them and returns an FFI table provider."""
+    """Run node ``name`` over ``inputs`` and return the result as a DataFrame.
+
+    Inputs whose plans serialize and read only local files are planned by
+    the plugin itself (its own parallel scans, pushdown and orderings);
+    anything else (in-memory tables, Python UDFs, object stores, ...) is
+    executed by datafusion-python and streamed to the plugin, partition by
+    partition. Both routes give the same results.
+    """
     ctx = ctx if ctx is not None else SessionContext.global_ctx()
-    try:
-        plans = [df.logical_plan().to_bytes(ctx) for df in inputs]
-    except Exception as e:
-        msg = (
-            f"{name}: an input DataFrame cannot be serialized ({e}). On datafusion "
-            "55 inputs must be file-sourced; in-memory tables and Python UDFs are "
-            "not supported."
-        )
-        raise ValueError(msg) from e
-    return ctx.read_table(PlanTable(name, plans, args))
+    route = _route()
+    table = None
+    if route in ("auto", "plan"):
+        try:
+            plans = [df.logical_plan().to_bytes(ctx) for df in inputs]
+            table = PlanTable(name, plans, args)
+        except Exception:
+            if route == "plan":
+                raise
+    if table is None:
+        table = StreamTable(name, list(inputs), args)
+    return ctx.read_table(table)
 
 
 def join_asof(
@@ -95,6 +110,7 @@ def join_asof(
     strategy: Literal["backward", "forward", "nearest"] = "backward",
     allow_exact_matches: bool = True,
     suffix: str = "_right",
+    assume_sorted: bool = False,
     check_sortedness: bool = True,
     ctx: SessionContext | None = None,
 ) -> DataFrame:
@@ -118,12 +134,16 @@ def join_asof(
         strategy: Only ``"backward"`` is supported.
         allow_exact_matches: If False, require ``right[on] < left[on]``.
         suffix: Appended to right column names that clash with left ones.
-        check_sortedness: Validate the order of an input whose order
-            DataFusion cannot prove, and raise ``left/right input is not
-            sorted by (...)`` if it is not sorted. Inputs with a proven order
-            (``read_parquet(..., file_sort_order=...)``, then filters and
-            projections) are only checked at batch and partition boundaries.
-            False trusts the data.
+        assume_sorted: Trust that each input partition arrives sorted by
+            ``(by..., on)`` (or ``on``) instead of requiring it. With False,
+            the node requires that order and DataFusion sorts only where it
+            can't prove it (a declared ``file_sort_order`` or your own
+            ``.sort()`` cost nothing). With True nothing is sorted and the
+            order is checked while streaming.
+        check_sortedness: With ``assume_sorted``, also check the order inside
+            every batch (vectorised), not only at batch and partition
+            boundaries. An unsorted input raises ``left/right input is not
+            sorted by (...)``.
         ctx: The SessionContext the inputs belong to; the result is a
             DataFrame of this context, and its configuration
             (``target_partitions``, ...) is used to plan the inputs. Defaults
@@ -136,16 +156,11 @@ def join_asof(
 
     Raises:
         NotImplementedError: ``strategy`` is not ``"backward"``.
-        ValueError: Invalid argument combinations, unknown columns or types,
-            or an input that cannot be serialized (see Notes).
+        ValueError: Invalid argument combinations, unknown columns or types.
 
-    Notes:
-        The inputs travel as serialized logical plans (datafusion-proto) and
-        are re-planned by the plugin, so they must be file-sourced (Parquet,
-        CSV, ...) under standard operators: filters, projections, joins,
-        aggregates. In-memory DataFrames (``from_pydict``, ``from_polars``,
-        ...) and Python UDFs cannot be serialized on DataFusion 55. Files are
-        read from the local filesystem.
+    Any input works: files, in-memory tables, Python UDFs, joins,
+    aggregates, unions. Inputs that read local files are planned by the
+    plugin; the others are executed by datafusion-python and streamed in.
     """
     if strategy != "backward":
         msg = f"join_asof: strategy={strategy!r} is not supported, only 'backward'"
@@ -169,6 +184,7 @@ def join_asof(
         "by_right": by_r,
         "allow_exact_matches": allow_exact_matches,
         "suffix": suffix,
+        "assume_sorted": assume_sorted,
         "check_sortedness": check_sortedness,
     }
     return _node("join_asof", [left, right], args, ctx)
@@ -196,6 +212,8 @@ def join_asof_markouts(
     by_left: str | Sequence[str] | None = None,
     by_right: str | Sequence[str] | None = None,
     allow_exact_matches: bool = True,
+    assume_sorted: bool = True,
+    check_sortedness: bool = True,
     ctx: SessionContext | None = None,
 ) -> DataFrame:
     """Backward ASOF joins at several time offsets, in one pass.
@@ -214,9 +232,22 @@ def join_asof_markouts(
         markouts: Offsets in seconds (ints or floats; negative, zero and
             fractional allowed; no duplicates). Each must be a whole number
             of the column's unit.
-        by: Equality column, the same name on both sides (one integer-like
-            column), or ``by_left`` and ``by_right``.
+        by: Equality column(s), the same names on both sides, or
+            ``by_left`` and ``by_right``.
         allow_exact_matches: If False, require ``right[on] < left[on] + h``.
+        assume_sorted: Trust that each input partition arrives sorted by
+            ``(by..., on)`` (or ``on``) instead of requiring it. With False,
+            the node requires that order and DataFusion sorts only where it
+            can't prove it (a declared ``file_sort_order`` or your own
+            ``.sort()`` cost nothing). With True nothing is sorted and the
+            order is checked while streaming.
+        check_sortedness: With ``assume_sorted``, also check the order inside
+            every batch (vectorised), not only at batch and partition
+            boundaries. An unsorted input raises ``left/right input is not
+            sorted by (...)``.
+            Unlike ``join_asof``, ``assume_sorted`` defaults to True: inputs
+            are expected sorted, as the node's typical use (trades vs quotes)
+            has them.
         ctx: The SessionContext the inputs belong to (default: global).
 
     Returns:
@@ -224,9 +255,7 @@ def join_asof_markouts(
         right column except ``on`` and ``by``, suffixed ``_{h}s`` (``_1s``,
         ``_0.5s``, ``_-5s``).
 
-    Inputs are assumed sorted by ``(by..., on)`` (or ``on``) and are not
-    validated beyond batch and partition boundaries. They must be scans of
-    one Parquet file each, optionally filtered or projected.
+    Any input works, as for :func:`join_asof`.
     """
     try:
         by_l, by_r = _by_args(by, by_left, by_right)
@@ -238,6 +267,8 @@ def join_asof_markouts(
         "by_left": by_l,
         "by_right": by_r,
         "allow_exact_matches": allow_exact_matches,
+        "assume_sorted": assume_sorted,
+        "check_sortedness": check_sortedness,
     }
     return _node("join_asof_markouts", [left, right], args, ctx)
 
@@ -246,8 +277,9 @@ def last_plan() -> str | None:
     """The physical plan most recently built by a node in this process.
 
     Planning happens when a result is executed (``collect``, ``to_polars``,
-    ...) or explained. Use it to check which mode ran (range-parallel, or
-    ``execute_once``) and that the filters reached the scans.
+    ...) or explained. Use it to check whether a sort was added, which input
+    route ran (``HostInputExec`` = streamed from datafusion-python), and that
+    filters reached the scans.
     """
     return _last_plan()
 

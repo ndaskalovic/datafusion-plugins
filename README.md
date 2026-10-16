@@ -7,14 +7,16 @@ Custom operators for [Apache DataFusion](https://datafusion.apache.org), usable 
 pip install git+https://github.com/ndaskalovic/datafusion-plugins   # needs a Rust toolchain
 ```
 
-Requires `datafusion==55.*`. Inputs must be file-backed; in-memory DataFrames are not supported yet.
+Requires `datafusion==55.*`. Inputs can be any DataFrame: files, in-memory tables, Python UDFs, joins,
+aggregates.
 
 ## Available
 
 ### `join_asof`
 
-Streaming asof join with polars-style arguments. Inputs must be sorted by `(by..., on)`, or by `on`
-when `by` is omitted.
+Streaming asof join with polars-style arguments. Inputs are sorted by `(by..., on)`, or by `on` when
+`by` is omitted: DataFusion sorts only what it can't prove sorted, or pass `assume_sorted=True` to
+trust the order (checked while streaming).
 
 ```python
 from datafusion import SessionContext, col
@@ -31,7 +33,8 @@ out = dp.join_asof(trades, quotes, on="ts", by="security_id", ctx=ctx)  # a Data
 ### `join_asof_markouts`
 
 Asof joins at several time offsets (markouts, in seconds) in one pass over the right side. `on` must
-be a timestamp; inputs are assumed sorted like `join_asof`. Right columns come out suffixed `_{h}s`.
+be a timestamp. Same ordering rules as `join_asof`, but `assume_sorted` defaults to `True`. Right
+columns come out suffixed `_{h}s`.
 
 ```python
 out = dp.join_asof_markouts(trades, quotes, on="ts", markouts=[1, 5, 60], by="security_id", ctx=ctx)

@@ -1,14 +1,10 @@
-//! Batch-level building blocks: galloping search, right-row references, the
-//! compacting right-row store and output assembly.
+//! Batch-level building blocks: galloping search, right-row references, key
+//! extraction and output gathering.
 
-use std::sync::Arc;
-
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array, new_null_array,
-};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array, new_null_array};
 use arrow::buffer::NullBuffer;
 use arrow::compute::{filter, filter_record_batch, interleave, take};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::physical_expr::PhysicalExprRef;
 
@@ -72,197 +68,6 @@ pub fn gallop_by<F: Fn(usize) -> bool>(n: usize, from: usize, le: F) -> usize {
     }
 }
 
-/// Gather rows `(batch, row)` from `batches` (all with `schema`) into one batch.
-pub fn gather_from(
-    schema: &SchemaRef,
-    batches: &[&RecordBatch],
-    idx: &[(usize, usize)],
-) -> Result<RecordBatch> {
-    if schema.fields().is_empty() {
-        let opts = RecordBatchOptions::new().with_row_count(Some(idx.len()));
-        return Ok(RecordBatch::try_new_with_options(
-            Arc::clone(schema),
-            vec![],
-            &opts,
-        )?);
-    }
-    if idx.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
-    }
-    let mut cols = Vec::with_capacity(schema.fields().len());
-    for j in 0..schema.fields().len() {
-        let arrs: Vec<&dyn Array> = batches.iter().map(|b| b.column(j).as_ref()).collect();
-        cols.push(interleave(&arrs, idx)?);
-    }
-    Ok(RecordBatch::try_new(Arc::clone(schema), cols)?)
-}
-
-/// Holds the right batches (payload columns only) that live references point
-/// into. When it grows past `max_sources` the referenced rows are copied into
-/// one compact batch and everything else is dropped, so retained memory is
-/// O(#groups + batch size) rather than O(right rows).
-pub struct RightStore {
-    pub schema: SchemaRef,
-    pub batches: Vec<RecordBatch>,
-    pub bytes: usize,
-    pub max_sources: usize,
-}
-
-impl RightStore {
-    pub fn new(schema: SchemaRef, max_sources: usize) -> Self {
-        Self {
-            schema,
-            batches: Vec::new(),
-            bytes: 0,
-            max_sources,
-        }
-    }
-
-    pub fn push(&mut self, b: RecordBatch) -> u32 {
-        self.bytes += b.get_array_memory_size();
-        self.batches.push(b);
-        (self.batches.len() - 1) as u32
-    }
-
-    pub fn needs_compaction(&self) -> bool {
-        self.batches.len() >= self.max_sources
-    }
-
-    /// Gather rows `(src, row)` into one batch with the store's schema.
-    pub fn gather(&self, idx: &[(usize, usize)]) -> Result<RecordBatch> {
-        let refs: Vec<&RecordBatch> = self.batches.iter().collect();
-        gather_from(&self.schema, &refs, idx)
-    }
-
-    /// Rewrite every live reference in `sets` to point into a single compact
-    /// batch (source 0) and drop all other batches.
-    pub fn compact(&mut self, sets: &mut [&mut [u64]]) -> Result<()> {
-        let mut idx: Vec<(usize, usize)> = Vec::new();
-        let mut last_old = NONE;
-        let mut last_new = NONE;
-        for set in sets.iter_mut() {
-            for r in set.iter_mut() {
-                if *r == NONE {
-                    continue;
-                }
-                if *r == last_old {
-                    *r = last_new;
-                    continue;
-                }
-                let old = *r;
-                let new = make_ref(0, idx.len());
-                idx.push((ref_src(old), ref_row(old)));
-                last_old = old;
-                last_new = new;
-                *r = new;
-            }
-        }
-        let compact = self.gather(&idx)?;
-        self.batches.clear();
-        self.bytes = 0;
-        self.push(compact);
-        Ok(())
-    }
-
-    /// Build one output column (payload column `j`) from references.
-    ///
-    /// `single_src` is the one source every non-NONE ref points into, if
-    /// there is one (see [`single_source`]); then a plain `take` is used,
-    /// otherwise `interleave`.
-    pub fn take_column(
-        &self,
-        j: usize,
-        refs: &[u64],
-        single_src: Option<Option<usize>>,
-    ) -> Result<ArrayRef> {
-        let dt = self.schema.field(j).data_type();
-        match single_src {
-            // Every ref is NONE.
-            Some(None) => return Ok(new_null_array(dt, refs.len())),
-            Some(Some(src)) => {
-                let idx: UInt32Array = refs
-                    .iter()
-                    .map(|r| if *r == NONE { None } else { Some(ref_row(*r) as u32) })
-                    .collect();
-                return Ok(take(self.batches[src].column(j).as_ref(), &idx, None)?);
-            }
-            None => {}
-        }
-        // Source 0 is a one-row null array used for unmatched rows.
-        let null = new_null_array(dt, 1);
-        let mut arrs: Vec<&dyn Array> = Vec::with_capacity(self.batches.len() + 1);
-        arrs.push(null.as_ref());
-        for b in &self.batches {
-            arrs.push(b.column(j).as_ref());
-        }
-        let idx: Vec<(usize, usize)> = refs
-            .iter()
-            .map(|r| {
-                if *r == NONE {
-                    (0, 0)
-                } else {
-                    (ref_src(*r) + 1, ref_row(*r))
-                }
-            })
-            .collect();
-        Ok(interleave(&arrs, &idx)?)
-    }
-}
-
-/// `Some(None)` if every ref is NONE, `Some(Some(src))` if all non-NONE refs
-/// point into one source batch, `None` if they span several.
-pub fn single_source(refs: &[u64]) -> Option<Option<usize>> {
-    let mut src: Option<usize> = None;
-    for r in refs {
-        if *r == NONE {
-            continue;
-        }
-        let s = ref_src(*r);
-        match src {
-            None => src = Some(s),
-            Some(cur) if cur != s => return None,
-            Some(_) => {}
-        }
-    }
-    Some(src)
-}
-
-/// One output column: from the left batch, or from the right payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutCol {
-    Left(usize),
-    Right(usize),
-}
-
-/// Assemble an output batch: left columns are passed through (zero copy),
-/// right columns are gathered from `store` by `refs`.
-pub fn build_output(
-    schema: &SchemaRef,
-    out_cols: &[OutCol],
-    left: &RecordBatch,
-    refs: &[u64],
-    store: &RightStore,
-) -> Result<RecordBatch> {
-    let mut cols = Vec::with_capacity(out_cols.len());
-    let single = if out_cols.iter().any(|c| matches!(c, OutCol::Right(_))) {
-        single_source(refs)
-    } else {
-        Some(None)
-    };
-    for c in out_cols {
-        match c {
-            OutCol::Left(i) => cols.push(Arc::clone(left.column(*i))),
-            OutCol::Right(j) => cols.push(store.take_column(*j, refs, single)?),
-        }
-    }
-    let opts = RecordBatchOptions::new().with_row_count(Some(left.num_rows()));
-    Ok(RecordBatch::try_new_with_options(
-        Arc::clone(schema),
-        cols,
-        &opts,
-    )?)
-}
-
 /// Evaluate the ts and `by` expressions of one side and their combined
 /// validity (`None` when every row is valid).
 pub fn eval_side(
@@ -297,9 +102,9 @@ pub fn left_keys<TN: TsNative, G: GroupKind>(
     Ok(Keys { ts, grp, valid, len, packed })
 }
 
-/// Extract keys and payload of a right batch. Rows with a NULL ts or `by` key
-/// can never match, so they are filtered out here. Returns `None` for a batch
-/// with no usable rows.
+/// Extract keys of a right batch and keep the payload columns. Rows with a
+/// NULL ts or `by` key can never match, so they are filtered out here.
+/// Returns `None` for a batch with no usable rows.
 pub fn right_keys<TN: TsNative, G: GroupKind>(
     g: &G,
     ts_expr: &PhysicalExprRef,
@@ -332,6 +137,42 @@ pub fn right_keys<TN: TsNative, G: GroupKind>(
     let (ts, grp) = (TN::extract(&ts)?, g.extract(&by)?);
     let packed = g.pack(&grp, ts.as_slice(), len);
     Ok(Some((Keys { ts, grp, valid: None, len, packed }, payload)))
+}
+
+/// Column `j` of `batches` gathered by `refs` (`NONE` = null).
+pub fn take_refs(batches: &[&RecordBatch], j: usize, dt: &DataType, refs: &[u64]) -> Result<ArrayRef> {
+    let mut src: Option<usize> = None;
+    let mut single = true;
+    for r in refs.iter().filter(|r| **r != NONE) {
+        match src {
+            None => src = Some(ref_src(*r)),
+            Some(s) if s != ref_src(*r) => {
+                single = false;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    match (src, single) {
+        (None, _) => Ok(new_null_array(dt, refs.len())),
+        (Some(s), true) => {
+            let idx: UInt32Array = refs
+                .iter()
+                .map(|r| (*r != NONE).then(|| ref_row(*r) as u32))
+                .collect();
+            Ok(take(batches[s].column(j).as_ref(), &idx, None)?)
+        }
+        _ => {
+            let null = new_null_array(dt, 1);
+            let mut arrs: Vec<&dyn Array> = vec![null.as_ref()];
+            arrs.extend(batches.iter().map(|b| b.column(j).as_ref()));
+            let idx: Vec<(usize, usize)> = refs
+                .iter()
+                .map(|r| if *r == NONE { (0, 0) } else { (ref_src(*r) + 1, ref_row(*r)) })
+                .collect();
+            Ok(interleave(&arrs, &idx)?)
+        }
+    }
 }
 
 #[cfg(test)]

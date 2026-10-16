@@ -1,13 +1,9 @@
 //! Compare `join_asof` against a brute-force reference on small random
 //! Parquet data, grouped and ungrouped, including ties, NULLs, groups without
-//! right rows, and many (often empty) byte-range partitions. Each case runs
-//!
-//! * the builder over ordered `read_parquet` scans (range-parallel mode),
-//! * the builder over a merged (so non-re-executable) left input, in
-//!   execute-once mode against the right scan's range partitions,
-//! * the builder over scans with no declared order, validated while
-//!   streaming (execute-once, one right unit),
-//! * the serialized-logical-plan provider (as used from Python).
+//! right rows, and many (often empty) partitions. Each case runs the builder
+//! over several upstream shapes (declared-order scans, a merged left, an
+//! assumed order, an order DataFusion has to sort for, round-robin
+//! repartitioned and unioned inputs) and the serialized-plan provider.
 
 use std::fs::File;
 use std::sync::Arc;
@@ -24,7 +20,7 @@ use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, col};
-use datafusion_plugins::{AsofOptions, JoinAsof, PlanBytesTable};
+use datafusion_plugins::{JoinAsof, PlanBytesTable};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum By {
@@ -205,27 +201,13 @@ fn reference(c: &Case, left: &[Row], right: &[Row]) -> Vec<(i64, Option<i64>)> {
         .collect()
 }
 
-fn options() -> AsofOptions {
-    AsofOptions {
-        right_split_factor: 8,
-        max_sources: 3, // force frequent compaction
-        // Many small left work units through the ordered output, with a
-        // window narrower than the partition count.
-        left_split_factor: 4,
-        ordered_output: true,
-        window_extra: 1,
-        // FANOUT=1 forces the sparse-left fan-out on every partition.
-        fanout_below: std::env::var("FANOUT").ok().map(|_| usize::MAX),
-        ..AsofOptions::default()
-    }
-}
-
 fn context() -> SessionContext {
     // Tiny files: force byte-range splitting and many small batches.
     let config = SessionConfig::new()
         .with_target_partitions(4)
         .with_batch_size(64)
-        .set_usize("datafusion.optimizer.repartition_file_min_size", 1);
+        .set_usize("datafusion.optimizer.repartition_file_min_size", 1)
+        .set_bool("datafusion.execution.enable_file_stream_work_stealing", false);
     SessionContext::new_with_config(config)
 }
 
@@ -261,10 +243,7 @@ async fn read(ctx: &SessionContext, c: &Case, path: &std::path::Path, ordered: b
 }
 
 fn join(c: &Case) -> JoinAsof {
-    JoinAsof::new("ts")
-        .by(by_cols(c))
-        .allow_exact_matches(!c.strict)
-        .options(options())
+    JoinAsof::new("ts").by(by_cols(c)).allow_exact_matches(!c.strict)
 }
 
 fn select_id_rid(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -280,27 +259,51 @@ fn select_id_rid(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Input {
-    /// Ordered scans: range-parallel mode.
+    /// Ordered scans (declared file order): no sort.
     Scans,
-    /// The left scan merged into one partition first (not a scan any more):
-    /// execute-once with right range units.
+    /// The left scan merged into one partition first.
     MergedLeft,
-    /// No declared order: validated while streaming, execute-once.
-    Unordered,
+    /// No declared order, `assume_sorted`: trusted and validated.
+    Assumed,
+    /// No declared order: DataFusion inserts the sort.
+    Sorted,
+    /// Round-robin repartitioned (overlapping streams), then required order.
+    RoundRobin,
+    /// Union of the scan with an empty-filtered copy: more partitions.
+    Union,
 }
 
 async fn run_builder(c: &Case, dir: &std::path::Path, input: Input) -> Result<(Rows, String), String> {
     let ctx = context();
-    let ordered = input != Input::Unordered;
+    let ordered = !matches!(input, Input::Assumed | Input::Sorted);
     let l = read(&ctx, c, &dir.join("left.parquet"), ordered).await;
     let r = read(&ctx, c, &dir.join("right.parquet"), ordered).await;
+    let (l, r) = if input == Input::Union {
+        let none = datafusion::prelude::lit(false);
+        (
+            l.clone().union(l.filter(none.clone()).unwrap()).unwrap(),
+            r.clone().union(r.filter(none).unwrap()).unwrap(),
+        )
+    } else {
+        (l, r)
+    };
     let mut left = l.create_physical_plan().await.unwrap();
-    let right = r.create_physical_plan().await.unwrap();
-    if input == Input::MergedLeft {
-        let ord: LexOrdering = left.output_ordering().unwrap().clone();
-        left = Arc::new(SortPreservingMergeExec::new(ord, left));
+    let mut right = r.create_physical_plan().await.unwrap();
+    match input {
+        Input::MergedLeft => {
+            let ord: LexOrdering = left.output_ordering().unwrap().clone();
+            left = Arc::new(SortPreservingMergeExec::new(ord, left));
+        }
+        Input::RoundRobin => {
+            use datafusion::physical_plan::Partitioning;
+            use datafusion::physical_plan::repartition::RepartitionExec;
+            left = Arc::new(RepartitionExec::try_new(left, Partitioning::RoundRobinBatch(3)).unwrap());
+            right = Arc::new(RepartitionExec::try_new(right, Partitioning::RoundRobinBatch(5)).unwrap());
+        }
+        _ => {}
     }
     let plan = join(c)
+        .assume_sorted(input == Input::Assumed)
         .build(left, right, ctx.state().config_options())
         .map_err(|e| e.to_string())?;
     let plan = select_id_rid(plan);
@@ -338,40 +341,39 @@ fn write_case(c: &Case, dir: &std::path::Path) -> (Vec<Row>, Vec<Row>) {
 async fn check(c: Case) {
     let dir = tempfile::tempdir().unwrap();
     let (left, right) = write_case(&c, dir.path());
-    // Same rows, same order as the left input.
+    // Same rows; same order as the left input where the input order is kept.
     let expect = reference(&c, &left, &right);
-    let check_one = |name: &str, got: &[(i64, Option<i64>)], plan: &str, once: bool| {
-        assert!(plan.contains("StreamingAsOfJoinExec"), "{name} {c:?}\n{plan}");
-        assert_eq!(plan.contains("execute_once"), once, "{name} mode, {c:?}\n{plan}");
-        assert!(!plan.contains("SortExec"), "{name}: unexpected sort\n{plan}");
+    let check_one = |name: &str, got: &[(i64, Option<i64>)], plan: &str, ordered: bool| {
+        assert!(plan.contains("AsofExec"), "{name} {c:?}\n{plan}");
         assert_eq!(got.len(), expect.len(), "{name} row count, {c:?}\n{plan}");
-        if plan.contains("SortPreservingMergeExec") {
-            // DataFusion's merge is not stable for equal keys across
-            // partitions: the merged left stream reorders tied left rows, and
-            // the join keeps that stream's order. Compare per left row.
+        if ordered {
+            for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
+                assert_eq!(g, e, "{name}: row {i}, case {c:?}\n{plan}");
+            }
+        } else {
+            // A sort or a merge of overlapping streams may reorder left rows
+            // with equal keys: compare per left row.
             let want: std::collections::HashMap<i64, Option<i64>> = expect.iter().cloned().collect();
             for (id, rid) in got {
                 assert_eq!(want.get(id), Some(rid), "{name}: left id {id}, case {c:?}\n{plan}");
             }
-        } else {
-            for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
-                assert_eq!(g, e, "{name}: row {i}, case {c:?}\n{plan}");
-            }
         }
     };
-    let (got, plan) = run_builder(&c, dir.path(), Input::Scans).await.unwrap();
-    check_one("scans", &got, &plan, false);
-    assert!(plan.contains("OrderedConcatExec"), "{c:?}\n{plan}");
-    for bad in ["RepartitionExec", "SortPreservingMergeExec", "CoalescePartitionsExec"] {
-        assert!(!plan.contains(bad), "unexpected {bad} in plan for {c:?}\n{plan}");
+    for input in [Input::Scans, Input::MergedLeft, Input::Assumed, Input::Sorted, Input::RoundRobin, Input::Union] {
+        let (got, plan) = run_builder(&c, dir.path(), input).await.unwrap();
+        let sorts = plan.contains("SortExec");
+        match input {
+            Input::Scans | Input::MergedLeft | Input::Assumed | Input::Union => {
+                assert!(!sorts, "{input:?}: unexpected sort\n{plan}")
+            }
+            Input::Sorted => assert!(sorts, "{input:?}: expected DataFusion's sort\n{plan}"),
+            Input::RoundRobin => {}
+        }
+        let ordered = matches!(input, Input::Scans | Input::Assumed);
+        check_one(&format!("{input:?}"), &got, &plan, ordered);
     }
-    let (got, plan) = run_builder(&c, dir.path(), Input::MergedLeft).await.unwrap();
-    check_one("merged left", &got, &plan, true);
-    assert!(plan.contains("right units"), "{c:?}\n{plan}");
-    let (got, plan) = run_builder(&c, dir.path(), Input::Unordered).await.unwrap();
-    check_one("unordered", &got, &plan, true);
     let (got, plan) = run_plan_bytes(&c, dir.path()).await;
-    check_one("plan bytes", &got, &plan, false);
+    check_one("plan bytes", &got, &plan, true);
 }
 
 fn base(seed: u64) -> Case {
@@ -450,6 +452,6 @@ async fn unsorted_input_is_an_error() {
     left.swap(n / 3, 2 * n / 3);
     write_parquet(&dir.path().join("left.parquet"), &c, &left, "lpx");
     let _ = right;
-    let err = run_builder(&c, dir.path(), Input::Unordered).await.unwrap_err();
+    let err = run_builder(&c, dir.path(), Input::Assumed).await.unwrap_err();
     assert!(err.contains("left input is not sorted by (g, ts)"), "{err}");
 }

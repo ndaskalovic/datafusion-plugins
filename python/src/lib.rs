@@ -8,14 +8,19 @@
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
+use arrow::array::{RecordBatch, StructArray};
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
+use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 use datafusion_plugins::{
-    AsofOptions, JoinAsof, JoinAsofMarkouts, Markout, PlanBytesTable, PlanNode, last_plan,
+    BatchReader, JoinAsof, JoinAsofMarkouts, Markout, PartitionSource, PlanBytesTable, PlanNode,
+    PreparedSource, StreamInputTable, last_plan,
 };
-use pyo3::exceptions::{PyImportError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyCapsule, PyDict};
+use pyo3::types::{PyCapsule, PyDict, PyTuple};
 
 /// This library's tokio runtime. Worker threads: `DATAFUSION_PLUGINS_THREADS`
 /// if set, else the number of CPUs. Read once, at first use.
@@ -86,8 +91,8 @@ fn join_asof(args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>> {
             .by_left_right(arg::<Vec<String>>(args, "by_left")?, arg::<Vec<String>>(args, "by_right")?)
             .allow_exact_matches(arg(args, "allow_exact_matches")?)
             .suffix(arg::<String>(args, "suffix")?)
-            .check_sortedness(arg(args, "check_sortedness")?)
-            .options(AsofOptions::from_env()),
+            .assume_sorted(arg(args, "assume_sorted")?)
+            .check_sortedness(arg(args, "check_sortedness")?),
     ))
 }
 
@@ -101,7 +106,8 @@ fn join_asof_markouts(args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>> {
         JoinAsofMarkouts::new(arg::<String>(args, "on")?, markouts)
             .by_left_right(arg::<Vec<String>>(args, "by_left")?, arg::<Vec<String>>(args, "by_right")?)
             .allow_exact_matches(arg(args, "allow_exact_matches")?)
-            .options(AsofOptions::from_env()),
+            .assume_sorted(arg(args, "assume_sorted")?)
+            .check_sortedness(arg(args, "check_sortedness")?),
     ))
 }
 
@@ -111,6 +117,157 @@ fn make_node(name: &str, args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>
         "join_asof" => join_asof(args),
         "join_asof_markouts" => join_asof_markouts(args),
         other => Err(PyValueError::new_err(format!("unknown node {other:?}"))),
+    }
+}
+
+fn provider_capsule<'py>(
+    py: Python<'py>,
+    session: &Bound<'py, PyAny>,
+    table: Arc<dyn datafusion::catalog::TableProvider>,
+) -> PyResult<Bound<'py, PyCapsule>> {
+    let codec = logical_codec(session)?;
+    let ffi = FFI_TableProvider::new_with_ffi_codec(table, false, Some(runtime().handle().clone()), codec);
+    PyCapsule::new_with_value(py, ffi, c"datafusion_table_provider")
+}
+
+fn df_err(e: PyErr) -> DataFusionError {
+    DataFusionError::External(Box::new(e))
+}
+
+/// A pyarrow schema (anything with `__arrow_c_schema__`) as an Arrow schema.
+fn import_schema(obj: &Bound<'_, PyAny>) -> PyResult<SchemaRef> {
+    let cap = obj.call_method0("__arrow_c_schema__")?;
+    let cap = cap.cast::<PyCapsule>()?;
+    let ptr: NonNull<FFI_ArrowSchema> = cap.pointer_checked(Some(c"arrow_schema"))?.cast();
+    let schema = Schema::try_from(unsafe { ptr.as_ref() })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(Arc::new(schema))
+}
+
+/// A batch (anything with `__arrow_c_array__`) as a RecordBatch, moving the
+/// data out of the capsule (zero copy).
+fn import_batch(obj: &Bound<'_, PyAny>, schema: &SchemaRef) -> PyResult<RecordBatch> {
+    // datafusion-python's internal RecordBatch exports through pyarrow.
+    let obj = if obj.hasattr("to_pyarrow")? { obj.call_method0("to_pyarrow")? } else { obj.clone() };
+    let pair = obj.call_method0("__arrow_c_array__")?;
+    let (sc, ac): (Bound<'_, PyAny>, Bound<'_, PyAny>) = pair.extract()?;
+    let (sc, ac) = (sc.cast::<PyCapsule>()?, ac.cast::<PyCapsule>()?);
+    let sp: NonNull<FFI_ArrowSchema> = sc.pointer_checked(Some(c"arrow_schema"))?.cast();
+    let ap: NonNull<FFI_ArrowArray> = ac.pointer_checked(Some(c"arrow_array"))?.cast();
+    let array = unsafe { FFI_ArrowArray::from_raw(ap.as_ptr()) };
+    let data = unsafe { from_ffi(array, sp.as_ref()) }.map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let batch = RecordBatch::from(StructArray::from(data));
+    Ok(batch.clone().with_schema(Arc::clone(schema)).unwrap_or(batch))
+}
+
+/// A datafusion-python DataFrame as an input the host executes.
+#[derive(Debug)]
+struct PyDataFrameSource {
+    df: Py<PyAny>,
+    schema: SchemaRef,
+}
+
+#[derive(Debug)]
+struct PyPrepared {
+    df: Py<PyAny>,
+    schema: SchemaRef,
+    partitions: usize,
+}
+
+/// One host partition stream, read on a plugin blocking thread. Each `next`
+/// takes the GIL briefly; datafusion-python releases it while it waits on
+/// its own runtime, so partitions are read concurrently.
+struct PyReader {
+    stream: Py<PyAny>,
+    schema: SchemaRef,
+}
+
+impl Iterator for PyReader {
+    type Item = DfResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| match self.stream.bind(py).call_method0("next") {
+            Ok(b) => Some(import_batch(&b, &self.schema).map_err(df_err)),
+            Err(e) if e.is_instance_of::<PyStopIteration>(py) => None,
+            Err(e) => Some(Err(df_err(e))),
+        })
+    }
+}
+
+impl PartitionSource for PyDataFrameSource {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn prepare(&self, columns: &[String]) -> DfResult<Arc<dyn PreparedSource>> {
+        Python::attach(|py| -> PyResult<Arc<dyn PreparedSource>> {
+            let df = self.df.bind(py);
+            let df = if columns.len() == self.schema.fields().len() {
+                df.clone()
+            } else {
+                df.call_method1("select", PyTuple::new(py, columns)?)?
+            };
+            let n = df.call_method0("execution_plan")?.getattr("partition_count")?;
+            let n = if n.is_callable() { n.call0()? } else { n };
+            let partitions: usize = n.extract()?;
+            let schema = import_schema(&df.call_method0("schema")?)?;
+            Ok(Arc::new(PyPrepared { df: df.unbind(), schema, partitions }))
+        })
+        .map_err(df_err)
+    }
+}
+
+impl PreparedSource for PyPrepared {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn partition_count(&self) -> usize {
+        self.partitions
+    }
+
+    fn open(&self) -> DfResult<Vec<BatchReader>> {
+        Python::attach(|py| -> PyResult<Vec<BatchReader>> {
+            let streams = self.df.bind(py).call_method0("execute_stream_partitioned")?;
+            let mut out: Vec<BatchReader> = Vec::new();
+            for s in streams.try_iter()? {
+                out.push(Box::new(PyReader { stream: s?.unbind(), schema: Arc::clone(&self.schema) }));
+            }
+            Ok(out)
+        })
+        .map_err(df_err)
+    }
+}
+
+/// A node over DataFrames the host executes (any input), as a table provider.
+#[pyclass(name = "StreamTable", module = "datafusion_plugins._internal", frozen)]
+struct PyStreamTable {
+    table: Arc<StreamInputTable>,
+}
+
+#[pymethods]
+impl PyStreamTable {
+    #[new]
+    fn new(node: &str, inputs: Vec<Bound<'_, PyAny>>, args: Bound<'_, PyDict>) -> PyResult<Self> {
+        let node = make_node(node, &args)?;
+        let sources = inputs
+            .iter()
+            .map(|df| {
+                let schema = import_schema(&df.call_method0("schema")?)?;
+                Ok(Arc::new(PyDataFrameSource { df: df.clone().unbind(), schema }) as Arc<dyn PartitionSource>)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let table = StreamInputTable::try_new(sources, node, Some(runtime().handle().clone()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { table: Arc::new(table) })
+    }
+
+    fn __datafusion_table_provider__<'py>(
+        &self,
+        py: Python<'py>,
+        session: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        provider_capsule(py, &session, Arc::clone(&self.table) as _)
     }
 }
 
@@ -137,14 +294,7 @@ impl PyPlanTable {
         py: Python<'py>,
         session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let codec = logical_codec(&session)?;
-        let ffi = FFI_TableProvider::new_with_ffi_codec(
-            Arc::clone(&self.table) as _,
-            false,
-            Some(runtime().handle().clone()),
-            codec,
-        );
-        PyCapsule::new_with_value(py, ffi, c"datafusion_table_provider")
+        provider_capsule(py, &session, Arc::clone(&self.table) as _)
     }
 }
 
@@ -163,6 +313,7 @@ fn ffi_version() -> u64 {
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPlanTable>()?;
+    m.add_class::<PyStreamTable>()?;
     m.add_function(wrap_pyfunction!(py_last_plan, m)?)?;
     m.add_function(wrap_pyfunction!(ffi_version, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

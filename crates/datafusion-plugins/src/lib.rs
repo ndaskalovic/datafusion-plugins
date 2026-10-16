@@ -7,10 +7,16 @@
 //! * [`JoinAsofMarkouts`]: ASOF joins at several time offsets ("markouts")
 //!   in one pass over the right input.
 //!
+//! Both plug in after any upstream plan: each input partition is executed
+//! once, the partitions are merged in key order ([`SortedMergeExec`] is the
+//! same merge as a standalone operator), and the order is either required
+//! (DataFusion sorts only where it can't prove it) or assumed and checked.
+//!
 //! Each node implements [`PlanNode`] (physical input plans in, physical plan
-//! out), so [`PlanBytesTable`] can run it over serialized logical plans, the
-//! way the Python package does. [`BridgeExec`] is the leaf the plan is handed
-//! out in; [`OrderedConcatExec`] is a reusable building block.
+//! out). [`StreamInputTable`] runs a node over inputs another engine executes
+//! (the Python package: datafusion-python DataFrames, read as Arrow
+//! streams); [`PlanBytesTable`] over serialized logical plans planned here.
+//! [`BridgeExec`] is the leaf a node's plan is handed out in.
 //!
 //! ```no_run
 //! # async fn example() -> datafusion::common::Result<()> {
@@ -34,19 +40,20 @@
 //! # Ok(()) }
 //! ```
 
+mod asof;
 mod bridge;
-mod exec;
+mod input;
 mod join_asof;
 mod kernel;
 mod keys;
 mod markouts;
-mod ordered;
+mod merge;
 mod plan_bytes;
-mod scan;
 
+pub use asof::{AsofExec, AsofSpec};
 pub use bridge::{BridgeExec, last_plan};
-pub use exec::{AsofOptions, StreamingAsOfJoinExec};
+pub use input::{BatchReader, HostInputExec, PartitionSource, PreparedSource, StreamInputTable};
 pub use join_asof::{JoinAsof, OutputColumn, Side};
-pub use markouts::{JoinAsofMarkouts, Markout, MarkoutsExec};
-pub use ordered::OrderedConcatExec;
+pub use markouts::{JoinAsofMarkouts, Markout};
+pub use merge::SortedMergeExec;
 pub use plan_bytes::{PlanBytesTable, PlanNode};

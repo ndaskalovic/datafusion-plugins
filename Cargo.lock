@@ -1335,6 +1335,7 @@ dependencies = [
 name = "datafusion-plugins-python"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "datafusion",
  "datafusion-ffi",
  "datafusion-plugins",

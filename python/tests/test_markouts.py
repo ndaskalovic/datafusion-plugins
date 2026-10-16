@@ -23,6 +23,7 @@ def make_ctx() -> SessionContext:
         .with_target_partitions(4)
         .with_batch_size(64)
         .set("datafusion.optimizer.repartition_file_min_size", "1")
+        .set("datafusion.execution.enable_file_stream_work_stealing", "false")
     )
     return SessionContext(config)
 
@@ -137,7 +138,7 @@ def test_matches_polars(c: Case, declared: bool, tmp_path: Path) -> None:
     lf, rf = (read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)) if declared else (ctx.read_parquet(lp), ctx.read_parquet(rp))
     got = run(c, ctx, lf, rf).to_polars()
     plan = dp.last_plan()
-    assert "MarkoutsExec" in plan and "SortExec" not in plan, plan
+    assert "AsofExec" in plan and "SortExec" not in plan, plan
     want = polars_markouts(c, left, right)
     assert got.columns == want.columns
     assert got.equals(want), (got, want)
@@ -150,7 +151,7 @@ def test_single_markout_equals_join_asof(tmp_path: Path) -> None:
     m = run(c, ctx, read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)).to_polars()
     shifted = ctx.read_parquet(lp, file_sort_order=[[col("g").sort(nulls_first=True), col("ts").sort(nulls_first=True)]])
     shifted = shifted.with_column("ts", col("ts") + lit(timedelta(seconds=5)))
-    a = dp.join_asof(shifted, read_sorted(ctx, rp, c), on="ts", by="g", ctx=ctx).to_polars()
+    a = dp.join_asof(shifted, read_sorted(ctx, rp, c), on="ts", by="g", assume_sorted=True, ctx=ctx).to_polars()
     assert m["rid_5s"].to_list() == a["rid"].to_list()
     assert m["px_5s"].to_list() == a["px_right"].to_list()
 
@@ -164,7 +165,7 @@ def test_headline_pipeline(tmp_path: Path) -> None:
     quotes = ctx.read_parquet(rp, file_sort_order=order)
     got = dp.join_asof_markouts(trades, quotes, on="ts", markouts=[1, 10, 60], by="g", ctx=ctx).to_polars()
     plan = dp.last_plan()
-    assert "MarkoutsExec" in plan and "OrderedConcatExec" in plan and "SortExec" not in plan, plan
+    assert "AsofExec" in plan and "SortExec" not in plan, plan
     assert "predicate=lpx@" in plan and "pruning_predicate" in plan, plan
     want = polars_markouts(c, left.filter(pl.col("lpx") > 100.0), right)
     assert got.equals(want)
@@ -195,6 +196,3 @@ def test_errors(tmp_path: Path) -> None:
         dp.join_asof_markouts(lf, rf, on="ts", markouts=["1"], by="g", ctx=ctx)
     with pytest.raises(ValueError, match="by_left"):
         dp.join_asof_markouts(lf, rf, on="ts", markouts=[1], by_left="g", ctx=ctx)
-    joined = lf.alias("a").join(lf.select("id").alias("b"), left_on="id", right_on="id")
-    with pytest.raises(Exception, match="scan of one Parquet file"):
-        dp.join_asof_markouts(joined, rf, on="ts", markouts=[1], by="g", ctx=ctx).collect()

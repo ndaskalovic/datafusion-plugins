@@ -8,7 +8,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, TimestampMicrosecondArray,
+    Array, ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -17,13 +17,17 @@ use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, col};
-use datafusion_plugins::{AsofOptions, JoinAsofMarkouts, Markout, PlanBytesTable};
+use datafusion_plugins::{JoinAsofMarkouts, Markout, PlanBytesTable};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum By {
     None,
     I32,
     I64,
+    /// Utf8 group ("g007": string order = numeric order).
+    Str,
+    /// Two columns: g (Int64) and h (Utf8, a function of g).
+    Multi,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +131,16 @@ fn write_parquet(path: &std::path::Path, c: &Case, rows: &[Row], payload: &str) 
             fields.push(Field::new("g", DataType::Int64, true));
             cols.push(Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.g))));
         }
+        By::Str => {
+            fields.push(Field::new("g", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from_iter(rows.iter().map(|r| r.g.map(|g| format!("g{g:03}"))))));
+        }
+        By::Multi => {
+            fields.push(Field::new("g", DataType::Int64, true));
+            cols.push(Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.g))));
+            fields.push(Field::new("h", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from_iter(rows.iter().map(|r| r.g.map(|g| format!("h{}", g % 2))))));
+        }
     }
     fields.push(Field::new("ts", ts_type(c), true));
     cols.push(ts_array(c, rows));
@@ -185,28 +199,23 @@ fn reference(c: &Case, left: &[Row], right: &[Row]) -> Vec<Vec<Option<i64>>> {
         .collect()
 }
 
-fn options() -> AsofOptions {
-    AsofOptions {
-        right_split_factor: 8,
-        max_sources: 3, // force frequent compaction
-        left_split_factor: 4,
-        window_extra: 1,
-        ..AsofOptions::default()
-    }
-}
-
 fn context() -> SessionContext {
     let config = SessionConfig::new()
         .with_target_partitions(4)
         .with_batch_size(64)
-        .set_usize("datafusion.optimizer.repartition_file_min_size", 1);
+        .set_usize("datafusion.optimizer.repartition_file_min_size", 1)
+        .set_bool("datafusion.execution.enable_file_stream_work_stealing", false);
     SessionContext::new_with_config(config)
 }
 
 fn node(c: &Case) -> JoinAsofMarkouts {
     let ms = c.markouts.iter().map(|m| Markout::parse(m).unwrap()).collect();
-    let n = JoinAsofMarkouts::new("ts", ms).allow_exact_matches(!c.strict).options(options());
-    if c.by == By::None { n } else { n.by(["g"]) }
+    let n = JoinAsofMarkouts::new("ts", ms).allow_exact_matches(!c.strict);
+    match c.by {
+        By::None => n,
+        By::Multi => n.by(["g", "h"]),
+        _ => n.by(["g"]),
+    }
 }
 
 fn label(m: &str) -> String {
@@ -238,7 +247,11 @@ fn rows_of(c: &Case, batches: &[RecordBatch]) -> Vec<(i64, Vec<Option<i64>>)> {
 async fn read(ctx: &SessionContext, c: &Case, path: &std::path::Path, ordered: bool) -> datafusion::dataframe::DataFrame {
     let mut o = ParquetReadOptions::default();
     if ordered {
-        let keys: Vec<&str> = if c.by == By::None { vec!["ts"] } else { vec!["g", "ts"] };
+        let keys: Vec<&str> = match c.by {
+            By::None => vec!["ts"],
+            By::Multi => vec!["g", "h", "ts"],
+            _ => vec!["g", "ts"],
+        };
         o = o.file_sort_order(vec![keys.iter().map(|k| col(*k).sort(true, true)).collect()]);
     }
     ctx.read_parquet(path.to_str().unwrap(), o).await.unwrap()
@@ -290,8 +303,8 @@ async fn check(c: Case) {
     };
     for ordered in [true, false] {
         let (got, plan) = run(&c, dir.path(), ordered).await.unwrap();
-        assert!(plan.contains("MarkoutsExec") && !plan.contains("SortExec"), "{plan}");
-        cmp(if ordered { "declared" } else { "undeclared" }, &got, &plan);
+        assert!(plan.contains("AsofExec") && !plan.contains("SortExec"), "{plan}");
+        cmp(if ordered { "declared" } else { "assumed" }, &got, &plan);
     }
     cmp("plan bytes", &run_plan_bytes(&c, dir.path()).await, "");
 }
@@ -325,6 +338,14 @@ async fn grouped_units_and_markouts() {
     check(Case { unit: TimeUnit::Microsecond, step: 1_000_000, base: 1_700_000_000_000_000, markouts: vec!["0.000001", "-1.5", "30"], ..base(5) }).await;
     check(Case { unit: TimeUnit::Nanosecond, step: 1_000_000_000, base: 1_700_000_000_000_000_000, tz: true, markouts: vec!["0.000000001", "10", "-10"], ..base(6) }).await;
     check(Case { by: By::I64, tz: true, ..base(7) }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn string_and_multi_column_by() {
+    check(Case { by: By::Str, ..base(8) }).await;
+    check(Case { by: By::Str, ts_range: 30, strict: true, markouts: vec!["-3", "0", "2"], ..base(9) }).await;
+    check(Case { by: By::Multi, ..base(12) }).await;
+    check(Case { by: By::Multi, null_per_mille: 100, markouts: vec!["10000", "-10000"], ..base(13) }).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

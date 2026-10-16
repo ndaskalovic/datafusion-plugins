@@ -23,10 +23,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Core crate tests
         run: cargo test -p datafusion-plugins
-      - name: Core crate tests (forced sparse-left fan-out)
-        run: cargo test -p datafusion-plugins --test compare
-        env:
-          FANOUT: "1"
 
   python:
     name: maturin + pytest (${{ matrix.os }})

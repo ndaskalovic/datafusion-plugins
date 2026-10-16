@@ -22,6 +22,9 @@ def make_ctx(target_partitions: int = 4) -> SessionContext:
         .with_target_partitions(target_partitions)
         .with_batch_size(64)
         .set("datafusion.optimizer.repartition_file_min_size", "1")
+        # Each scan partition one byte range read in order (no stealing), so
+        # a sorted file's partitions are each sorted for the host route too.
+        .set("datafusion.execution.enable_file_stream_work_stealing", "false")
     )
     return SessionContext(config)
 
@@ -169,24 +172,26 @@ def run(c: Case, ctx: SessionContext, lf, rf, **kw):
     return out
 
 
-# Declared order (range-parallel mode), or none (validated while streaming,
-# execute-once mode).
-@pytest.mark.parametrize("declared", [True, False], ids=["declared", "undeclared"])
+# Declared order (nothing sorted), no order (DataFusion sorts: tied left
+# rows may be reordered), or no order with assume_sorted (trusted, checked).
+@pytest.mark.parametrize("mode", ["declared", "sorted", "assumed"])
 @pytest.mark.parametrize("c", CASES, ids=case_id)
-def test_matches_polars(c: Case, declared: bool, tmp_path: Path) -> None:
+def test_matches_polars(c: Case, mode: str, tmp_path: Path) -> None:
     left, right, lp, rp = write(c, tmp_path)
     ctx = make_ctx()
-    if declared:
+    if mode == "declared":
         lf, rf = read_sorted(ctx, lp, c), read_sorted(ctx, rp, c)
     else:
         lf, rf = ctx.read_parquet(lp), ctx.read_parquet(rp)
-    got = run(c, ctx, lf, rf).select("id", "rid").to_polars()
+    got = run(c, ctx, lf, rf, assume_sorted=mode == "assumed").select("id", "rid").to_polars()
     plan = dp.last_plan()
-    assert "SortExec" not in plan, plan
-    assert ("execute_once" in plan) != declared, plan
-    if declared:
-        assert "OrderedConcatExec" in plan, plan
-    check_result(c, left, right, got)
+    assert ("SortExec" in plan) == (mode == "sorted"), plan
+    if mode == "sorted":
+        want = dict(zip(left["id"].to_list(), reference(c, left, right)))
+        assert dict(zip(got["id"].to_list(), got["rid"].to_list())) == want
+        assert got.height == left.height
+    else:
+        check_result(c, left, right, got)
 
 
 def test_headline_pipeline(tmp_path: Path) -> None:
@@ -211,8 +216,7 @@ def test_headline_pipeline(tmp_path: Path) -> None:
         .to_polars()
     )
     plan = dp.last_plan()
-    assert "SortExec" not in plan and "execute_once" not in plan, plan
-    assert "OrderedConcatExec" in plan
+    assert "SortExec" not in plan and "HostInputExec" not in plan, plan
     assert "predicate=lpx@" in plan and "pruning_predicate" in plan, plan
     lf = left.filter(pl.col("lpx") > 100.0).with_columns(notional=pl.col("lpx") * 2)
     want = polars_ref(c, lf, right)
@@ -241,10 +245,10 @@ def test_input_is_a_join(tmp_path: Path) -> None:
     out = dp.join_asof(lf, rf, on="ts", by="g", ctx=ctx)
     got = out.select("id", "w", "rid").to_polars()
     plan = dp.last_plan()
-    assert "execute_once" in plan and "HashJoinExec" in plan and "SortExec" not in plan, plan
+    assert "HashJoinExec" in plan, plan
     lj = left.join(dim, on="g", how="inner")
-    want = polars_ref(c, lj, right)
-    assert got.equals(want.select("id", "w", "rid"))
+    want = polars_ref(c, lj, right).select("id", "w", "rid")
+    assert got.sort("id").equals(want.sort("id"))
 
 
 def test_not_sorted_raises(tmp_path: Path) -> None:
@@ -253,12 +257,14 @@ def test_not_sorted_raises(tmp_path: Path) -> None:
     shuffled = str(tmp_path / "left_shuffled.parquet")
     left.sample(fraction=1.0, shuffle=True, seed=2).write_parquet(shuffled, row_group_size=37)
     ctx = make_ctx()
-    out = dp.join_asof(ctx.read_parquet(shuffled), ctx.read_parquet(rp), on="ts", by="g", ctx=ctx)
+    out = dp.join_asof(ctx.read_parquet(shuffled), ctx.read_parquet(rp), on="ts", by="g", assume_sorted=True, ctx=ctx)
     with pytest.raises(Exception, match=r"left input is not sorted by \(g, ts\)"):
         out.collect()
     shuffled_r = str(tmp_path / "right_shuffled.parquet")
     right.sample(fraction=1.0, shuffle=True, seed=3).write_parquet(shuffled_r, row_group_size=37)
-    out = dp.join_asof(ctx.read_parquet(lp), ctx.read_parquet(shuffled_r), on="ts", ctx=ctx)
+    by_ts = str(tmp_path / "left_by_ts.parquet")
+    left.sort("ts", maintain_order=True).write_parquet(by_ts, row_group_size=37)
+    out = dp.join_asof(ctx.read_parquet(by_ts), ctx.read_parquet(shuffled_r), on="ts", assume_sorted=True, ctx=ctx)
     with pytest.raises(Exception, match=r"right input is not sorted by \(ts\)"):
         out.collect()
 
@@ -269,7 +275,7 @@ def test_check_sortedness_false_trusts(tmp_path: Path) -> None:
     ctx = make_ctx()
     out = dp.join_asof(
         ctx.read_parquet(lp), ctx.read_parquet(rp), on="ts", by="g",
-        check_sortedness=False, ctx=ctx,
+        assume_sorted=True, check_sortedness=False, ctx=ctx,
     )
     check_result(c, left, right, out.select("id", "rid").to_polars())
 
@@ -342,10 +348,3 @@ def test_argument_validation(tmp_path: Path) -> None:
         dp.join_asof(lf, rf, on="ts", by_left="g", ctx=ctx)
     with pytest.raises(ValueError, match="not found"):
         dp.join_asof(lf, rf, on="nope", ctx=ctx)
-
-
-def test_in_memory_input_is_rejected() -> None:
-    ctx = make_ctx()
-    a = ctx.from_pydict({"ts": [1, 2, 3], "x": [1.0, 2.0, 3.0]})
-    with pytest.raises(ValueError, match="serialized|file-sourced"):
-        dp.join_asof(a, a, on="ts", ctx=ctx)

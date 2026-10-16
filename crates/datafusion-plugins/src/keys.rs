@@ -20,7 +20,7 @@ use std::hash::Hash;
 use arrow::array::{Array, ArrayRef};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{ArrowNativeType, DataType};
-use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow::row::{RowConverter, Rows, SortField};
 use datafusion::common::{Result, internal_err};
 
 /// A key column: either a zero-copy view of an Arrow value buffer or an owned
@@ -161,11 +161,6 @@ pub fn is_primitive_group_type(dt: &DataType) -> bool {
 pub trait GroupKind: Send + Sync + 'static {
     /// Per-batch group column.
     type Col: Send + Sync + 'static;
-    /// Owned group key (for candidates and partition bounds).
-    type Owned: Clone + Ord + Hash + Eq + Send + Sync + Debug + 'static;
-    /// True if [`GroupKind::pack`] returns packed keys: the kernel then
-    /// compares plain i128s (no `by`, or one primitive `by` key).
-    const PACKS: bool;
 
     fn extract(&self, by: &[ArrayRef]) -> Result<Self::Col>;
     /// `(group, ts)` packed into one order-preserving i128 per row, for group
@@ -174,12 +169,6 @@ pub trait GroupKind: Send + Sync + 'static {
         None
     }
     fn cmp_at(&self, a: &Self::Col, i: usize, b: &Self::Col, j: usize) -> Ordering;
-    fn cmp_owned(&self, a: &Self::Owned, b: &Self::Col, j: usize) -> Ordering;
-    fn key_owned(&self, c: &Self::Col, i: usize) -> Self::Owned;
-    /// The group half of a packed key for an owned key (packing kinds only).
-    fn owned_packed(&self, _k: &Self::Owned) -> Option<i64> {
-        None
-    }
 }
 
 /// Ungrouped join: one implicit group.
@@ -207,8 +196,6 @@ pub fn packed_group(k: i128) -> i64 {
 
 impl GroupKind for NoGroup {
     type Col = ();
-    type Owned = ();
-    const PACKS: bool = true;
 
     fn extract(&self, _by: &[ArrayRef]) -> Result<()> {
         Ok(())
@@ -219,15 +206,6 @@ impl GroupKind for NoGroup {
     #[inline]
     fn cmp_at(&self, _a: &(), _i: usize, _b: &(), _j: usize) -> Ordering {
         Ordering::Equal
-    }
-    #[inline]
-    fn cmp_owned(&self, _a: &(), _b: &(), _j: usize) -> Ordering {
-        Ordering::Equal
-    }
-    #[inline]
-    fn key_owned(&self, _c: &(), _i: usize) {}
-    fn owned_packed(&self, _k: &()) -> Option<i64> {
-        Some(0)
     }
 }
 
@@ -256,8 +234,6 @@ impl<GN: TsNative> GroupKind for PrimGroup<GN> {
         )
     }
     type Col = KeyCol<GN>;
-    type Owned = GN;
-    const PACKS: bool = true;
 
     fn extract(&self, by: &[ArrayRef]) -> Result<KeyCol<GN>> {
         GN::extract(&by[0])
@@ -265,17 +241,6 @@ impl<GN: TsNative> GroupKind for PrimGroup<GN> {
     #[inline]
     fn cmp_at(&self, a: &KeyCol<GN>, i: usize, b: &KeyCol<GN>, j: usize) -> Ordering {
         a.as_slice()[i].cmp(&b.as_slice()[j])
-    }
-    #[inline]
-    fn cmp_owned(&self, a: &GN, b: &KeyCol<GN>, j: usize) -> Ordering {
-        a.cmp(&b.as_slice()[j])
-    }
-    #[inline]
-    fn key_owned(&self, c: &KeyCol<GN>, i: usize) -> GN {
-        c.as_slice()[i]
-    }
-    fn owned_packed(&self, k: &GN) -> Option<i64> {
-        Some(TsNative::to_i64(*k))
     }
 }
 
@@ -301,8 +266,6 @@ impl RowGroup {
 
 impl GroupKind for RowGroup {
     type Col = Rows;
-    type Owned = OwnedRow;
-    const PACKS: bool = false;
 
     fn extract(&self, by: &[ArrayRef]) -> Result<Rows> {
         Ok(self.converter.convert_columns(by)?)
@@ -311,23 +274,8 @@ impl GroupKind for RowGroup {
     fn cmp_at(&self, a: &Rows, i: usize, b: &Rows, j: usize) -> Ordering {
         a.row(i).cmp(&b.row(j))
     }
-    #[inline]
-    fn cmp_owned(&self, a: &OwnedRow, b: &Rows, j: usize) -> Ordering {
-        a.row().cmp(&b.row(j))
-    }
-    fn key_owned(&self, c: &Rows, i: usize) -> OwnedRow {
-        c.row(i).owned()
-    }
 }
 
-/// Merge key `(group, ts)`; without `by` the group is `()`.
-pub type Key<TN, G> = (<G as GroupKind>::Owned, TN);
-
-/// Lexicographic `(group, ts)` order.
-#[inline]
-pub fn cmp_keys<TN: TsNative, G: GroupKind>(a: &Key<TN, G>, b: &Key<TN, G>) -> Ordering {
-    a.0.cmp(&b.0).then(a.1.cmp(&b.1))
-}
 
 /// Extracted keys of one batch.
 pub struct Keys<TN: TsNative, G: GroupKind> {
@@ -347,9 +295,6 @@ impl<TN: TsNative, G: GroupKind> Keys<TN, G> {
         self.valid.as_ref().is_none_or(|v| v.is_valid(i))
     }
 
-    pub fn key_at(&self, g: &G, i: usize) -> Key<TN, G> {
-        (g.key_owned(&self.grp, i), self.ts.as_slice()[i])
-    }
 
     /// True if the valid rows are sorted by `(group, ts)`. Branch-free on
     /// packed keys without nulls, so it vectorises.

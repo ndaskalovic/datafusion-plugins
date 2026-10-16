@@ -1,25 +1,10 @@
 //! Building a `join_asof` plan from two physical inputs, with polars
-//! `join_asof(strategy="backward")` semantics and contract.
+//! `join_asof(strategy="backward")` semantics.
 //!
-//! Contract: with `by`, each input must be sorted by `(by..., on)`; without,
-//! by `on`. Nothing is sorted for you (as in polars: sort it yourself).
-//!
-//! [`JoinAsof::build`]:
-//!
-//! 1. **Order.** An input whose order DataFusion can prove (a declared file
-//!    order surviving filters and projections) runs with only the O(1)
-//!    batch- and partition-boundary checks. Otherwise, with
-//!    `check_sortedness` (the default), every batch is validated as it
-//!    streams, and an unsorted input fails with "left/right input is not
-//!    sorted by (...)"; without it, the data is trusted.
-//! 2. **Fast mode** when both inputs are re-executable scans of one Parquet
-//!    file each (under filters and projections) with a proven order: the
-//!    scans are split into ordered byte ranges (right x32, left x4 of
-//!    `target_partitions`), each left range seeks its right start by binary
-//!    search, and [`OrderedConcatExec`] emits one ordered partition.
-//! 3. **Execute-once mode** otherwise: every input partition is executed
-//!    exactly once (see the `exec` module).
-//! 4. A final projection gives the output polars' columns and names.
+//! With `by`, each input must arrive sorted by `(by..., on)`; without, by
+//! `on`. Unless `assume_sorted`, the node requires that order and DataFusion
+//! adds a sort only where it can't prove it; with `assume_sorted` the order
+//! is trusted and checked while streaming (see [`crate::asof`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,19 +12,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::{Result, plan_datafusion_err, plan_err};
+use datafusion::physical_expr::PhysicalExprRef;
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::ExecutionPlan;
 
-use crate::exec::{AsofOptions, StreamingAsOfJoinExec};
+use crate::asof::{AsofSpec, build};
 use crate::keys::{RowGroup, is_primitive_group_type, is_supported_ts_type};
-use crate::ordered::OrderedConcatExec;
 use crate::plan_bytes::PlanNode;
-use crate::scan::{
-    merge, nulls_first_of, pin_order, range_partitioned, resplit, satisfies, single_file_scan,
-    sort_exprs,
-};
 
 /// Which input an output column comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +47,10 @@ pub struct JoinAsof {
     pub by_right: Vec<String>,
     pub allow_exact_matches: bool,
     pub suffix: String,
+    /// Trust the inputs' order instead of requiring it.
+    pub assume_sorted: bool,
+    /// With `assume_sorted`: check the order inside every batch.
     pub check_sortedness: bool,
-    pub options: AsofOptions,
 }
 
 impl JoinAsof {
@@ -88,8 +69,8 @@ impl JoinAsof {
             by_right: Vec::new(),
             allow_exact_matches: true,
             suffix: "_right".to_string(),
+            assume_sorted: false,
             check_sortedness: true,
-            options: AsofOptions::default(),
         }
     }
 
@@ -128,8 +109,8 @@ impl JoinAsof {
         self
     }
 
-    pub fn options(mut self, options: AsofOptions) -> Self {
-        self.options = options;
+    pub fn assume_sorted(mut self, assume: bool) -> Self {
+        self.assume_sorted = assume;
         self
     }
 
@@ -258,124 +239,40 @@ impl JoinAsof {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (ls, rs) = (left.schema(), right.schema());
         self.validate(&ls, &rs)?;
-        let mut options = self.options.clone();
-        let tp = config.execution.target_partitions.max(1);
-
         let col = |s: &Schema, name: &str| -> Result<PhysicalExprRef> {
             Ok(Arc::new(Column::new(name, s.index_of(name)?)) as PhysicalExprRef)
         };
-        let left_ts = col(&ls, &self.left_on)?;
-        let right_ts = col(&rs, &self.right_on)?;
-        let lby = self.by_left.iter().map(|b| col(&ls, b)).collect::<Result<Vec<_>>>()?;
-        let rby = self.by_right.iter().map(|b| col(&rs, b)).collect::<Result<Vec<_>>>()?;
-        let mut kl = lby.clone();
-        kl.push(Arc::clone(&left_ts));
-        let mut kr = rby.clone();
-        kr.push(Arc::clone(&right_ts));
-
-        // 1. Proven orders; the others are validated while streaming (or
-        // trusted). Never sorted.
-        let lnf = nulls_first_of(left.equivalence_properties(), &kl)?;
-        let rnf = nulls_first_of(right.equivalence_properties(), &kr)?;
-        let (left_proven, right_proven) = (lnf.is_some(), rnf.is_some());
-        let (lnf, rnf) = (lnf.unwrap_or(true), rnf.unwrap_or(true));
-        options.validate_left |= !left_proven && self.check_sortedness;
-        options.validate_right |= !right_proven && self.check_sortedness;
-        let lsort = sort_exprs(&kl, lnf);
-        let rsort = sort_exprs(&kr, rnf);
-
-        // 2. Fast mode: re-executable single-file scans with a proven order.
-        let fast = left_proven
-            && right_proven
-            && config.optimizer.repartition_file_scans
-            && options.ordered_output
-            && single_file_scan(&left)
-            && single_file_scan(&right);
-        let (left, right, right_units) = if fast {
-            let right = match resplit(&right, tp * options.right_split_factor.max(1), config)? {
-                Some(r) if satisfies(&r, &rsort)? => r,
-                _ => right,
-            };
-            let left = match resplit(&left, tp * options.left_split_factor.max(1), config)? {
-                Some(l) if satisfies(&l, &lsort)? => l,
-                _ => left,
-            };
-            (left, right, None)
-        } else {
-            // 3. Execute-once. Range-partitioned inputs (consecutive key
-            // ranges: a split scan, maybe under a broadcast join) are read in
-            // partition order; the right side's ranges become units when
-            // their order is proven. Other multi-partition inputs are merged
-            // (their partitions each sorted, proven or validated).
-            let left = if range_partitioned(&left) { pin_order(left)? } else { merge(left, &lsort)? };
-            let (right, units) = if range_partitioned(&right) {
-                let right = pin_order(right)?;
-                if right_proven {
-                    let r = match resplit(&right, tp * options.left_split_factor.max(1), config)? {
-                        Some(r) if satisfies(&r, &rsort)? => r,
-                        _ => right,
-                    };
-                    (r, true)
-                } else {
-                    (right, false)
-                }
-            } else {
-                (merge(right, &rsort)?, false)
-            };
-            (left, right, Some(units))
-        };
-
-        // The join outputs every left column (the ordered output checks the
-        // order on them) and only the right columns that are used.
-        let nl = ls.fields().len();
-        let mut embedded: Vec<usize> = (0..nl).collect();
-        let mut right_used: Vec<usize> = Vec::new();
-        for o in outputs.iter().filter(|o| o.side == Side::Right) {
-            let j = rs.index_of(&o.column)?;
-            if !right_used.contains(&j) {
-                right_used.push(j);
-                embedded.push(nl + j);
-            }
-        }
-        let on: Vec<(PhysicalExprRef, PhysicalExprRef)> = lby.into_iter().zip(rby).collect();
-        let exec = StreamingAsOfJoinExec::try_new(
-            left,
-            right,
-            on,
-            left_ts,
-            right_ts,
-            !self.allow_exact_matches,
-            lnf,
-            rnf,
-            Some(embedded),
-            options.clone(),
-        )?;
-        let exec = match right_units {
-            Some(units) => exec.with_execute_once(units),
-            None => exec,
-        };
-        let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
-        let joined: Arc<dyn ExecutionPlan> = if exec.output_partitioning().partition_count() > 1 {
-            let window = tp + options.window_extra;
-            Arc::new(OrderedConcatExec::try_new(Arc::clone(&exec), window)?)
-        } else {
-            exec
-        };
-
-        // 4. Output column order and names.
-        let js = joined.schema();
-        let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(outputs.len());
+        let mut payload_idx: Vec<usize> = Vec::new();
+        let mut right_out = Vec::new();
+        let mut exec_outputs = Vec::with_capacity(outputs.len());
         for o in outputs {
-            let pos = match o.side {
-                Side::Left => ls.index_of(&o.column)?,
+            match o.side {
+                Side::Left => exec_outputs.push((ls.index_of(&o.column)?, o.name.clone())),
                 Side::Right => {
                     let j = rs.index_of(&o.column)?;
-                    nl + right_used.iter().position(|x| *x == j).expect("embedded")
+                    let p = payload_idx.iter().position(|x| *x == j).unwrap_or_else(|| {
+                        payload_idx.push(j);
+                        payload_idx.len() - 1
+                    });
+                    exec_outputs.push((ls.fields().len() + right_out.len(), o.name.clone()));
+                    right_out.push((0, p, o.name.clone()));
                 }
-            };
-            exprs.push((Arc::new(Column::new(js.field(pos).name(), pos)), o.name.clone()));
+            }
         }
-        Ok(Arc::new(ProjectionExec::try_new(exprs, joined)?))
+        let spec = AsofSpec {
+            left_on: col(&ls, &self.left_on)?,
+            right_on: col(&rs, &self.right_on)?,
+            left_by: self.by_left.iter().map(|b| col(&ls, b)).collect::<Result<_>>()?,
+            right_by: self.by_right.iter().map(|b| col(&rs, b)).collect::<Result<_>>()?,
+            shifts: vec![0],
+            strict: !self.allow_exact_matches,
+            payload_idx,
+            right_out,
+            assume_sorted: self.assume_sorted,
+            check_sortedness: self.check_sortedness,
+            nulls_first: (true, true),
+        };
+        build(left, right, spec, &exec_outputs, config)
     }
 }
 

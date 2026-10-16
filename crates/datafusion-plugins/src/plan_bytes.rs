@@ -9,10 +9,9 @@
 //! Planning locally means filter and projection pushdown into the input
 //! scans, and their declared orderings, are fully visible to the node.
 //!
-//! Only plans datafusion-proto can serialize work: file scans (Parquet, CSV,
-//! JSON, ...) under any standard operators. In-memory tables and Python UDFs
-//! cannot be serialized on DataFusion 55. Files are read from the local
-//! filesystem.
+//! Only plans that datafusion-proto can serialize and whose scans read local
+//! files qualify (others are rejected here; the Python package then uses
+//! [`crate::StreamInputTable`]).
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::{Column, Result, plan_datafusion_err};
+use datafusion::common::{Column, Result, plan_datafusion_err, plan_err};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
@@ -44,11 +43,45 @@ pub(crate) fn decode_plan(bytes: &[u8], ctx: &SessionContext) -> Result<LogicalP
 }
 
 fn context_for(config: &ConfigOptions) -> SessionContext {
+    // Without work stealing, each scan partition is one byte range read in
+    // order, so a sorted file's partitions are each sorted.
+    let mut config = config.clone();
+    config.execution.enable_file_stream_work_stealing = false;
+    // More, smaller scan ranges: the nodes' merge then decodes several
+    // disjoint ranges ahead in parallel (see `merge`). Execution still uses
+    // the caller's thread count. `DATAFUSION_PLUGINS_SCAN_SPLIT` (default 8).
+    let split = std::env::var("DATAFUSION_PLUGINS_SCAN_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    config.execution.target_partitions = config.execution.target_partitions.max(1) * split;
     let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::from(config.clone()))
+        .with_config(SessionConfig::from(config))
         .with_default_features()
         .build();
     SessionContext::new_with_state(state)
+}
+
+/// Every scan of `plan` reads local files through a `ListingTable`, so it
+/// can be planned here with the same result as in the host session.
+fn local_files_only(plan: &LogicalPlan) -> Result<()> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::listing::ListingTable;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node {
+            let provider = datafusion::datasource::source_as_provider(&scan.source)?;
+            let any: &dyn std::any::Any = provider.as_ref();
+            let local = any
+                .downcast_ref::<ListingTable>()
+                .is_some_and(|t| t.table_paths().iter().all(|u| u.scheme() == "file"));
+            if !local {
+                return plan_err!("input scan of {} is not a local file table", scan.table_name);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(())
 }
 
 /// Keep only `cols` of `plan`, so the optimizer prunes the input scans.
@@ -118,7 +151,11 @@ impl PlanBytesTable {
         let ctx = context_for(&ConfigOptions::default());
         let schemas = inputs
             .iter()
-            .map(|b| Ok(Arc::new(decode_plan(b, &ctx)?.schema().as_arrow().clone())))
+            .map(|b| {
+                let plan = decode_plan(b, &ctx)?;
+                local_files_only(&plan)?;
+                Ok(Arc::new(plan.schema().as_arrow().clone()))
+            })
             .collect::<Result<Vec<SchemaRef>>>()?;
         let schema = node.schema(&schemas)?;
         Ok(Self {
