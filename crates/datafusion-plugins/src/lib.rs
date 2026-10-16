@@ -51,7 +51,7 @@ mod merge;
 mod plan_bytes;
 
 pub use asof::{AsofExec, AsofSpec};
-pub use bridge::{BridgeExec, last_plan};
+pub use bridge::{BridgeExec, last_plan, set_memory_pool};
 pub use input::{BatchReader, HostInputExec, PartitionSource, PreparedSource, StreamInputTable};
 pub use join_asof::{JoinAsof, OutputColumn, Side};
 pub use markouts::{JoinAsofMarkouts, Markout};

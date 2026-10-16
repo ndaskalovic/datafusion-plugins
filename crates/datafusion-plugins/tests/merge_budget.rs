@@ -1,5 +1,5 @@
-//! The merge with a tiny shared read-ahead budget (own test binary: the
-//! budget is read from the environment).
+//! The merge with a tiny read-ahead ceiling (own test binary: the ceiling
+//! override is read from the environment).
 
 use std::sync::Arc;
 
@@ -7,6 +7,10 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::memory_pool::{
+    MemoryPool, PeakRecordingPool, UnboundedMemoryPool,
+};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::{ExecutionPlan, collect};
@@ -54,12 +58,18 @@ fn plan(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Arc<dyn ExecutionPlan> 
 }
 
 async fn merge(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Vec<(Option<i64>, i64)> {
+    merge_in(parts, bs, Arc::new(UnboundedMemoryPool::default())).await
+}
+
+/// Merge with `pool` as the memory pool.
+async fn merge_in(parts: &[Vec<(Option<i64>, i64)>], bs: usize, pool: Arc<dyn MemoryPool>) -> Vec<(Option<i64>, i64)> {
     let ord = LexOrdering::new(vec![PhysicalSortExpr {
         expr: Arc::new(Column::new("k", 0)),
         options: SortOptions { descending: false, nulls_first: true },
     }])
     .unwrap();
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(16));
+    let runtime = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc().unwrap();
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_batch_size(16), runtime);
     let m = Arc::new(SortedMergeExec::new(plan(parts, bs), ord));
     let mut out = Vec::new();
     for b in collect(m, ctx.task_ctx()).await.unwrap() {
@@ -94,12 +104,18 @@ fn sorted_part(rng: &mut Rng, n: usize, lo: i64, span: u64, id0: i64, nulls: boo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tiny_budget_disjoint_and_overlapping() {
-    // ~2 KiB of shared read-ahead: later ranges fill it while the first one
-    // drains; the drained stream must still make progress (no deadlock).
+    // ~2 KiB of read-ahead: later ranges fill it while the first one drains;
+    // the drained stream must still make progress (no deadlock), and under
+    // an unbounded pool the peak stays within the ceiling plus the two
+    // unconditional batches per partition.
     unsafe { std::env::set_var("DATAFUSION_PLUGINS_READAHEAD_MB", "0.002") };
     let mut rng = Rng(5);
     let parts: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 3000, p * 100_000, 100_000, p * 100_000, false)).collect();
-    assert_eq!(merge(&parts, 64).await, expected(&parts));
+    let pool = Arc::new(PeakRecordingPool::new(Arc::new(UnboundedMemoryPool::default())));
+    assert_eq!(merge_in(&parts, 64, Arc::clone(&pool) as _).await, expected(&parts));
+    let one = 64 * 16 + 1024; // a 64-row (k, id) batch, with slack for buffers
+    let bound = (0.002 * 1048576.0) as usize + parts.len() * 2 * one;
+    assert!(pool.peak_reserved() <= bound, "peak {} > {bound}", pool.peak_reserved());
     let parts: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 2000, 0, 500, p * 100_000, true)).collect();
     assert_eq!(merge(&parts, 32).await, expected(&parts));
 }

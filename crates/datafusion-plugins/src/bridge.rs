@@ -7,6 +7,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Result, plan_err};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
@@ -15,6 +17,35 @@ use datafusion::physical_plan::{
 use futures::Stream;
 
 static LAST_PLAN: Mutex<Option<String>> = Mutex::new(None);
+static MEMORY_POOL: Mutex<Option<Arc<dyn MemoryPool>>> = Mutex::new(None);
+
+/// The memory pool for plans run through [`BridgeExec`], or `None` to use
+/// the caller's. A caller in another library (datafusion-python over FFI)
+/// can't share its pool: DataFusion 55's FFI task context arrives with a
+/// default, unbounded one. Set a limit here instead.
+pub fn set_memory_pool(pool: Option<Arc<dyn MemoryPool>>) {
+    if let Ok(mut g) = MEMORY_POOL.lock() {
+        *g = pool;
+    }
+}
+
+/// `context` with the pool set by [`set_memory_pool`], if any.
+fn with_pool(context: Arc<TaskContext>) -> Result<Arc<TaskContext>> {
+    let Some(pool) = MEMORY_POOL.lock().ok().and_then(|g| g.clone()) else {
+        return Ok(context);
+    };
+    let runtime = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc()?;
+    Ok(Arc::new(TaskContext::new(
+        context.task_id(),
+        context.session_id(),
+        context.session_config().clone(),
+        context.scalar_functions().clone(),
+        context.higher_order_functions().clone(),
+        context.aggregate_functions().clone(),
+        context.window_functions().clone(),
+        runtime,
+    )))
+}
 
 /// The physical plan most recently built by a node's table provider in this process
 /// (indented), for debugging and tests.
@@ -132,6 +163,7 @@ impl ExecutionPlan for BridgeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let context = with_pool(context)?;
         match &self.runtime {
             None => self.inner.execute(partition, context),
             Some(rt) => {

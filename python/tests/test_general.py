@@ -254,3 +254,16 @@ def test_string_and_multi_column_by_markouts(data) -> None:
             rs_.drop("g"), on="ts", by=["gs", "h"], strategy="backward")
         want = want.hstack(j.select([pl.col(n).alias(f"{n}_{h}s") for n in payload]))
     assert got.equals(want)
+
+
+def test_plugin_memory_limit(data) -> None:
+    left, right, lp, rp, _ = data
+    ctx = make_ctx()
+    lf, rf = ctx.read_parquet(lp, file_sort_order=ORDER), ctx.read_parquet(rp, file_sort_order=ORDER)
+    try:
+        for limit, pool in ((256 << 10, "fair"), (4 << 20, "greedy")):
+            dp.set_memory_limit(limit, pool)
+            both(ctx, lf, rf, left, right)
+            both(ctx, ctx.from_polars(left), ctx.from_polars(right), left, right, assume_sorted=True)
+    finally:
+        dp.set_memory_limit(None)

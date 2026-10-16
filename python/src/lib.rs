@@ -304,6 +304,22 @@ fn py_last_plan() -> Option<String> {
     last_plan()
 }
 
+/// Limit the memory of the plugin's plans (`None`: unbounded). `pool` is
+/// "fair" (FairSpillPool) or "greedy" (GreedyMemoryPool).
+#[pyfunction]
+#[pyo3(signature = (limit, pool = "fair"))]
+fn set_memory_limit(limit: Option<usize>, pool: &str) -> PyResult<()> {
+    use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
+    let pool: Option<Arc<dyn MemoryPool>> = match (limit, pool) {
+        (None, _) => None,
+        (Some(l), "fair") => Some(Arc::new(FairSpillPool::new(l))),
+        (Some(l), "greedy") => Some(Arc::new(GreedyMemoryPool::new(l))),
+        (_, other) => return Err(PyValueError::new_err(format!("pool must be 'fair' or 'greedy', got {other:?}"))),
+    };
+    datafusion_plugins::set_memory_pool(pool);
+    Ok(())
+}
+
 /// The major DataFusion (FFI) version this library was built against.
 #[pyfunction]
 fn ffi_version() -> u64 {
@@ -316,6 +332,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStreamTable>()?;
     m.add_function(wrap_pyfunction!(py_last_plan, m)?)?;
     m.add_function(wrap_pyfunction!(ffi_version, m)?)?;
+    m.add_function(wrap_pyfunction!(set_memory_limit, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

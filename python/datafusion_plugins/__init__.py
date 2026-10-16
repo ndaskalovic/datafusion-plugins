@@ -31,10 +31,10 @@ from datafusion import DataFrame, SessionContext
 
 import os
 
-from ._internal import PlanTable, StreamTable, __version__, ffi_version
+from ._internal import PlanTable, StreamTable, __version__, ffi_version, set_memory_limit
 from ._internal import last_plan as _last_plan
 
-__all__ = ["__version__", "join_asof", "join_asof_markouts", "last_plan"]
+__all__ = ["__version__", "join_asof", "join_asof_markouts", "last_plan", "set_memory_limit"]
 
 
 def _names(arg: str | Sequence[str] | None) -> list[str] | None:

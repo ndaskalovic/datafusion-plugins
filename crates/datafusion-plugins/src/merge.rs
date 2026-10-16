@@ -14,13 +14,12 @@
 //!
 //! Disjoint ranges (a sorted file split into byte ranges) therefore cost one
 //! comparison per batch. Overlapping streams (round-robin, unions) advance
-//! together. With disjoint ranges the merge drains one range at a time, so a
-//! later range only runs ahead as far as its buffer: two batches, plus a
-//! read-ahead budget shared by all partitions (`DATAFUSION_PLUGINS_READAHEAD_MB`,
-//! default 512 MB per input). Many small ranges (a high `target_partitions`
-//! where the input is planned) let several later ranges decode completely
-//! within the budget while an earlier one drains, which restores upstream
-//! parallelism; memory stays bounded by the budget.
+//! together. With disjoint ranges the merge drains one range at a time, so
+//! later ranges only run ahead as far as their buffers: two batches each,
+//! plus read-ahead from the memory pool for the nearest partitions still
+//! producing. That read-ahead starts small and grows only while the merge is
+//! starved (see `Budget`), up to a ceiling scaled to the machine and the
+//! input; a memory-limited pool caps it further.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -41,6 +40,9 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream,
 };
 use futures::StreamExt;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::SeqCst;
 use tokio::sync::mpsc;
 
 use crate::kernel::gallop_by;
@@ -90,24 +92,92 @@ pub(crate) struct OrderCheck {
     pub hint: String,
 }
 
-/// Batches each partition may queue regardless of the shared budget, so the
-/// stream the merge is waiting on never blocks on it.
+/// Batches each partition may queue regardless of the budget, so the stream
+/// the merge is waiting on never blocks on it.
 const FREE: usize = 2;
 
-/// Read-ahead of one input beyond `FREE` batches per partition, split into
-/// equal quotas among the partitions allowed to read ahead: lets later
-/// disjoint ranges decode while an earlier one drains.
-/// `DATAFUSION_PLUGINS_READAHEAD_MB` (default 512).
-fn readahead_bytes() -> usize {
-    let mb = std::env::var("DATAFUSION_PLUGINS_READAHEAD_MB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(512.0);
-    ((mb * 1024.0 * 1024.0) as usize).max(1)
+/// Read-ahead memory of one merged input, beyond `FREE` batches per
+/// partition. It comes from the memory pool (a failed `try_grow` makes the
+/// partition wait, never fail), and its target is set by feedback: it starts
+/// at a few batches per window partition and doubles only while the merge
+/// is starved, i.e. waits on a partition while partitions in the window wait
+/// on budget, so more read-ahead would buy parallelism. Growth stops at the
+/// ceiling (see [`ceiling`]).
+struct Budget {
+    res: MemoryReservation,
+    /// Read-ahead bytes queued beyond the free slots...
+    extra: AtomicUsize,
+    /// ...and their target (0 until the first batch sets the start).
+    target: AtomicUsize,
+    ceiling: usize,
+    window: usize,
+    /// Window partitions waiting for budget.
+    blocked: AtomicUsize,
+    /// Wakes them when the target grows or budget is freed.
+    notify: tokio::sync::Notify,
+    peak: AtomicUsize,
 }
 
-/// A batch and its size in bytes.
-type Item<K> = (Result<Prepared<K>>, usize);
+impl Budget {
+    /// Try to take `size` bytes of read-ahead.
+    fn take(&self, size: usize) -> bool {
+        if self.target.load(SeqCst) == 0 {
+            let start = (self.window * FREE * size).min(self.ceiling).max(1);
+            let _ = self.target.compare_exchange(0, start, SeqCst, SeqCst);
+        }
+        if self.extra.load(SeqCst) + size > self.target.load(SeqCst) || self.res.try_grow(size).is_err() {
+            return false;
+        }
+        self.extra.fetch_add(size, SeqCst);
+        self.peak.fetch_max(self.res.size(), SeqCst);
+        true
+    }
+
+    /// The merge is waiting: if window partitions wait on budget, grow.
+    fn starved(&self) {
+        if self.blocked.load(SeqCst) > 0 {
+            let t = self.target.load(SeqCst);
+            let grown = t.saturating_mul(2).min(self.ceiling);
+            if grown > t && self.target.compare_exchange(t, grown, SeqCst, SeqCst).is_ok() {
+                self.notify.notify_waiters();
+            }
+        }
+    }
+}
+
+/// Physical memory of the machine, if known.
+fn physical_memory() -> Option<usize> {
+    let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    (pages > 0 && size > 0).then(|| pages as usize * size as usize)
+}
+
+/// Ceiling of one input's read-ahead: an eighth of physical memory (so the
+/// two inputs of a node stay under a quarter), and no more than `window`
+/// partitions' worth of the input's estimated size: only that many read
+/// ahead at a time, so buffering more buys nothing. A memory-limited pool
+/// caps it further through `try_grow`; `DATAFUSION_PLUGINS_READAHEAD_MB` is
+/// an optional hard cap.
+fn ceiling(plan: &Arc<dyn ExecutionPlan>, window: usize) -> usize {
+    let ram = physical_memory().map_or(1 << 30, |m| m / 8);
+    let stats = datafusion::physical_plan::StatisticsContext::new()
+        .compute(plan.as_ref(), &datafusion::physical_plan::StatisticsArgs::new());
+    let input = stats
+        .ok()
+        .and_then(|s| s.total_byte_size.get_value().copied())
+        .filter(|b| *b > 0)
+        .map_or(usize::MAX, |b| {
+            let n = plan.output_partitioning().partition_count().max(1);
+            b / n * window.min(n)
+        });
+    let cap = std::env::var("DATAFUSION_PLUGINS_READAHEAD_MB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(usize::MAX, |mb| (mb * 1024.0 * 1024.0) as usize);
+    ram.min(input).min(cap).max(1)
+}
+
+/// A batch, its size in bytes, and whether it holds read-ahead budget.
+type Item<K> = (Result<Prepared<K>>, usize, bool);
 
 /// What a partition has queued, shared by its producer and the merge.
 #[derive(Default)]
@@ -121,6 +191,7 @@ struct Queue {
 struct Input<K> {
     rx: mpsc::UnboundedReceiver<Item<K>>,
     queue: Arc<Queue>,
+    budget: Arc<Budget>,
     cur: Option<(Prepared<K>, usize)>,
     done: bool,
 }
@@ -130,7 +201,7 @@ pub(crate) struct MergedStream<K: MergeKeys> {
     inputs: Vec<Input<K>>,
     batch_size: usize,
     _tasks: tokio::task::JoinSet<()>,
-
+    budget: Arc<Budget>,
 }
 
 /// Execute every partition of `plan` once and merge them in key order.
@@ -143,13 +214,21 @@ pub(crate) fn merged<K: MergeKeys>(
     let n = plan.output_partitioning().partition_count();
     let mut tasks = tokio::task::JoinSet::new();
     let mut inputs = Vec::with_capacity(n);
-    // A partition reads ahead (up to its quota) while fewer than `window`
+    // A partition reads ahead on the budget while fewer than `window`
     // lower-indexed partitions are still producing: with disjoint ranges that
-    // keeps `window` ranges decoding, nearest first, each with room to
-    // buffer while the merge drains the ones before it.
-    // Twice the threads, so I/O waits inside a decode don't idle the CPU.
+    // keeps `window` ranges decoding, nearest first, while the merge drains
+    // the ones before. Twice the threads, so I/O waits don't idle the CPU.
     let window = 2 * ctx.session_config().target_partitions().max(1);
-    let quota = readahead_bytes() / window;
+    let budget = Arc::new(Budget {
+        res: MemoryConsumer::new("AsofMerge read-ahead").register(ctx.memory_pool()),
+        extra: AtomicUsize::new(0),
+        target: AtomicUsize::new(0),
+        ceiling: ceiling(plan, window),
+        window,
+        blocked: AtomicUsize::new(0),
+        notify: tokio::sync::Notify::new(),
+        peak: AtomicUsize::new(0),
+    });
     let finished: Arc<Vec<std::sync::atomic::AtomicBool>> =
         Arc::new((0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
     let (done_tx, done_rx) = tokio::sync::watch::channel(0usize);
@@ -157,7 +236,7 @@ pub(crate) fn merged<K: MergeKeys>(
     for q in 0..n {
         let (tx, rx) = mpsc::unbounded_channel::<Item<K>>();
         let queue = Arc::new(Queue::default());
-        let queue_p = Arc::clone(&queue);
+        let (queue_p, budget_p) = (Arc::clone(&queue), Arc::clone(&budget));
         let mut done_p = done_rx.clone();
         let (finished_p, done_tx_p) = (Arc::clone(&finished), Arc::clone(&done_tx));
         let mut stream = plan.execute(q, Arc::clone(ctx))?;
@@ -205,33 +284,45 @@ pub(crate) fn merged<K: MergeKeys>(
                     Err(e) => Err(e),
                 };
                 let failed = item.is_err();
-                use std::sync::atomic::Ordering::SeqCst;
                 let size = item.as_ref().map(|p| p.batch.get_array_memory_size()).unwrap_or(0);
                 let tw = std::time::Instant::now();
                 t_wait -= tw.duration_since(t).as_secs_f64(); // (prep counted as decode)
                 t_dec += tw.duration_since(t).as_secs_f64();
                 t = tw;
-                // A free slot, or room in the quota while in the window. The
-                // merge frees slots of the stream it is waiting on, so that
-                // stream never waits on the others.
-                loop {
-                    let (n_q, b_q) = (queue_p.batches.load(SeqCst), queue_p.bytes.load(SeqCst));
+                // A free slot (always accounted, never refused), or read-ahead
+                // budget while in the window. The merge frees slots of the
+                // stream it is waiting on, so that stream never waits on the
+                // others.
+                let extra = loop {
+                    if queue_p.batches.load(SeqCst) < FREE {
+                        budget_p.res.grow(size);
+                        break false;
+                    }
                     let in_window = finished_p[..q].iter().filter(|f| !f.load(SeqCst)).count() < window;
-                    if n_q < FREE || (in_window && b_q + size <= quota) {
-                        queue_p.batches.fetch_add(1, SeqCst);
-                        queue_p.bytes.fetch_add(size, SeqCst);
-                        break;
+                    let more = budget_p.notify.notified();
+                    tokio::pin!(more);
+                    more.as_mut().enable();
+                    if in_window && budget_p.take(size) {
+                        break true;
                     }
-                    tokio::select! {
-                        _ = queue_p.notify.notified() => {}
-                        r = done_p.changed() => {
-                            if r.is_err() {
-                                return;
-                            }
-                        }
+                    if in_window {
+                        budget_p.blocked.fetch_add(1, SeqCst);
                     }
-                }
-                if tx.send((item, size)).is_err() || failed {
+                    let stop = tokio::select! {
+                        _ = queue_p.notify.notified() => false,
+                        _ = &mut more, if in_window => false,
+                        r = done_p.changed() => r.is_err(),
+                    };
+                    if in_window {
+                        budget_p.blocked.fetch_sub(1, SeqCst);
+                    }
+                    if stop {
+                        return;
+                    }
+                };
+                queue_p.batches.fetch_add(1, SeqCst);
+                queue_p.bytes.fetch_add(size, SeqCst);
+                if tx.send((item, size, extra)).is_err() || failed {
                     return;
                 }
                 t_wait += t.elapsed().as_secs_f64();
@@ -247,6 +338,7 @@ pub(crate) fn merged<K: MergeKeys>(
         inputs.push(Input {
             rx,
             queue,
+            budget: Arc::clone(&budget),
             cur: None,
             done: false,
         });
@@ -255,7 +347,22 @@ pub(crate) fn merged<K: MergeKeys>(
         inputs,
         batch_size: ctx.session_config().batch_size().max(1),
         _tasks: tasks,
+        budget,
     })
+}
+
+impl<K: MergeKeys> Drop for MergedStream<K> {
+    fn drop(&mut self) {
+        if std::env::var_os("DATAFUSION_PLUGINS_TRACE").is_some() {
+            let b = &self.budget;
+            eprintln!(
+                "[budget] peak reservation {:.1} MB, final target {:.1} MB, ceiling {:.1} MB",
+                b.peak.load(SeqCst) as f64 / 1048576.0,
+                b.target.load(SeqCst) as f64 / 1048576.0,
+                b.ceiling as f64 / 1048576.0
+            );
+        }
+    }
 }
 
 impl<K: MergeKeys> MergedStream<K> {
@@ -279,11 +386,24 @@ impl<K: MergeKeys> MergedStream<K> {
     pub(crate) async fn next(&mut self) -> Result<Option<Merged<K>>> {
         for inp in self.inputs.iter_mut() {
             while inp.cur.is_none() && !inp.done {
-                match inp.rx.recv().await {
-                    Some((item, size)) => {
-                        use std::sync::atomic::Ordering::SeqCst;
+                let got = match inp.rx.try_recv() {
+                    Ok(x) => Some(x),
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // The merge has to wait for this partition.
+                        inp.budget.starved();
+                        inp.rx.recv().await
+                    }
+                };
+                match got {
+                    Some((item, size, extra)) => {
                         inp.queue.batches.fetch_sub(1, SeqCst);
                         inp.queue.bytes.fetch_sub(size, SeqCst);
+                        inp.budget.res.shrink(size);
+                        if extra {
+                            inp.budget.extra.fetch_sub(size, SeqCst);
+                            inp.budget.notify.notify_waiters();
+                        }
                         inp.queue.notify.notify_one();
                         inp.cur = Some((item?, 0));
                     }

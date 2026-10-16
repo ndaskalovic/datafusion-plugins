@@ -1325,6 +1325,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "futures",
+ "libc",
  "object_store",
  "parquet",
  "tempfile",

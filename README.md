@@ -8,7 +8,8 @@ pip install git+https://github.com/ndaskalovic/datafusion-plugins   # needs a Ru
 ```
 
 Requires `datafusion==55.*`. Inputs can be any DataFrame: files, in-memory tables, Python UDFs, joins,
-aggregates.
+aggregates. DataFusion 55 doesn't pass the session's memory limit to plugins; set one with
+`dp.set_memory_limit(bytes)`.
 
 ## Available
 

@@ -8,6 +8,10 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::memory_pool::{
+    FairSpillPool, GreedyMemoryPool, MemoryPool, PeakRecordingPool, UnboundedMemoryPool,
+};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::{ExecutionPlan, collect};
@@ -55,12 +59,18 @@ fn plan(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Arc<dyn ExecutionPlan> 
 }
 
 async fn merge(parts: &[Vec<(Option<i64>, i64)>], bs: usize) -> Vec<(Option<i64>, i64)> {
+    merge_in(parts, bs, Arc::new(UnboundedMemoryPool::default())).await
+}
+
+/// Merge with `pool` as the memory pool.
+async fn merge_in(parts: &[Vec<(Option<i64>, i64)>], bs: usize, pool: Arc<dyn MemoryPool>) -> Vec<(Option<i64>, i64)> {
     let ord = LexOrdering::new(vec![PhysicalSortExpr {
         expr: Arc::new(Column::new("k", 0)),
         options: SortOptions { descending: false, nulls_first: true },
     }])
     .unwrap();
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(16));
+    let runtime = RuntimeEnvBuilder::new().with_memory_pool(pool).build_arc().unwrap();
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_batch_size(16), runtime);
     let m = Arc::new(SortedMergeExec::new(plan(parts, bs), ord));
     let mut out = Vec::new();
     for b in collect(m, ctx.task_ctx()).await.unwrap() {
@@ -124,4 +134,32 @@ async fn single_and_empty_streams() {
     assert_eq!(merge(&with_empty, 8).await, expected(&with_empty));
     let all_empty: Vec<Vec<(Option<i64>, i64)>> = vec![Vec::new(), Vec::new()];
     assert!(merge(&all_empty, 8).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_limited_pools() {
+    // Pools far smaller than the input: read-ahead stops, results are
+    // still right and nothing deadlocks.
+    let mut rng = Rng(17);
+    let disjoint: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 3000, p * 100_000, 100_000, p * 100_000, false)).collect();
+    let overlap: Vec<_> = (0..6).map(|p| sorted_part(&mut rng, 2000, 0, 300, p * 100_000, true)).collect();
+    for limit in [1usize, 16 << 10, 256 << 10] {
+        let pools: [Arc<dyn MemoryPool>; 2] =
+            [Arc::new(GreedyMemoryPool::new(limit)), Arc::new(FairSpillPool::new(limit))];
+        for pool in pools {
+            assert_eq!(merge_in(&disjoint, 64, Arc::clone(&pool)).await, expected(&disjoint), "limit {limit}");
+            assert_eq!(merge_in(&overlap, 32, Arc::clone(&pool)).await, expected(&overlap), "limit {limit}");
+            assert_eq!(pool.reserved(), 0, "limit {limit}: reservation not returned");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reservation_grows_and_returns_to_zero() {
+    let mut rng = Rng(19);
+    let parts: Vec<_> = (0..5).map(|p| sorted_part(&mut rng, 5000, p * 100_000, 100_000, p * 100_000, false)).collect();
+    let pool = Arc::new(PeakRecordingPool::new(Arc::new(UnboundedMemoryPool::default())));
+    assert_eq!(merge_in(&parts, 64, Arc::clone(&pool) as _).await, expected(&parts));
+    assert!(pool.peak_reserved() > 0, "read-ahead was not accounted");
+    assert_eq!(pool.reserved(), 0, "reservation not returned");
 }

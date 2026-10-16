@@ -12,3 +12,9 @@ class StreamTable:
 
 def last_plan() -> str | None: ...
 def ffi_version() -> int: ...
+def set_memory_limit(limit: int | None, pool: str = "fair") -> None:
+    """Limit the memory of the plugin's plans (None: unbounded).
+
+    A limit set on the datafusion SessionContext does not reach the plugin:
+    DataFusion 55's FFI passes the plugin a default, unbounded pool.
+    """
