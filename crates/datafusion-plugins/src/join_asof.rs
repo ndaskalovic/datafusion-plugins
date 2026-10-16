@@ -22,36 +22,24 @@
 //! 4. A final projection gives the output polars' columns and names.
 
 use std::collections::HashSet;
-use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{JoinType, Result, plan_datafusion_err, plan_err};
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
-use datafusion::datasource::source::DataSourceExec;
-use datafusion::execution::TaskContext;
+use datafusion::common::{Result, plan_datafusion_err, plan_err};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{
-    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalExprRef, PhysicalSortExpr,
-};
-use datafusion::physical_plan::coop::CooperativeExec;
-use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
-    PlanProperties, RecordBatchStream, ReplaceChildrenOptions, SendableRecordBatchStream,
-    displayable,
-};
-use futures::Stream;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::exec::{AsofOptions, StreamingAsOfJoinExec};
 use crate::keys::{RowGroup, is_primitive_group_type, is_supported_ts_type};
 use crate::ordered::OrderedConcatExec;
+use crate::plan_bytes::PlanNode;
+use crate::scan::{
+    merge, nulls_first_of, pin_order, range_partitioned, resplit, satisfies, single_file_scan,
+    sort_exprs,
+};
 
 /// Which input an output column comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,344 +397,57 @@ pub fn output_schema(outputs: &[OutputColumn], left: &Schema, right: &Schema) ->
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn sort_exprs(exprs: &[PhysicalExprRef], nulls_first: bool) -> Vec<PhysicalSortExpr> {
-    exprs
-        .iter()
-        .map(|e| PhysicalSortExpr {
-            expr: Arc::clone(e),
-            options: SortOptions {
-                descending: false,
-                nulls_first,
-            },
-        })
-        .collect()
-}
+impl PlanNode for JoinAsof {
+    fn schema(&self, inputs: &[SchemaRef]) -> Result<SchemaRef> {
+        let [l, r] = two(inputs)?;
+        self.validate(l, r)?;
+        self.output_schema(l, r)
+    }
 
-/// `Some(nulls_first)` if `eq` satisfies an ascending order on `exprs`,
-/// trying NULLS FIRST then NULLS LAST (null keys never match, so either
-/// placement works).
-fn nulls_first_of(eq: &EquivalenceProperties, exprs: &[PhysicalExprRef]) -> Result<Option<bool>> {
-    for nf in [true, false] {
-        if eq.ordering_satisfy(sort_exprs(exprs, nf))? {
-            return Ok(Some(nf));
-        }
-    }
-    Ok(None)
-}
-
-fn satisfies(plan: &Arc<dyn ExecutionPlan>, sort: &[PhysicalSortExpr]) -> Result<bool> {
-    plan.equivalence_properties().ordering_satisfy(sort.to_vec())
-}
-
-/// Merge the (each sorted) partitions of `plan` into one ordered partition.
-fn merge(plan: Arc<dyn ExecutionPlan>, sort: &[PhysicalSortExpr]) -> Result<Arc<dyn ExecutionPlan>> {
-    if plan.output_partitioning().partition_count() <= 1 {
-        return Ok(plan);
-    }
-    let lex = LexOrdering::new(sort.to_vec())
-        .ok_or_else(|| plan_datafusion_err!("join_asof: empty sort key"))?;
-    Ok(Arc::new(SortPreservingMergeExec::new(lex, plan)))
-}
-
-/// Nodes that keep their input's partitions and row order.
-fn passthrough(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
-    if plan.is::<FilterExec>()
-        || plan.is::<ProjectionExec>()
-        || plan.is::<CooperativeExec>()
-    {
-        plan.children().into_iter().next()
-    } else {
-        None
-    }
-}
-
-/// The distinct files of a Parquet `DataSourceExec`, if `plan` is one.
-fn parquet_files(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<String>> {
-    let dse = plan.downcast_ref::<DataSourceExec>()?;
-    let (conf, _) = dse.downcast_to_file_source::<ParquetSource>()?;
-    let mut files: Vec<String> = Vec::new();
-    for g in &conf.file_groups {
-        for f in g.iter() {
-            let p = f.object_meta.location.to_string();
-            if !files.contains(&p) {
-                files.push(p);
-            }
-        }
-    }
-    Some(files)
-}
-
-/// A re-executable scan of exactly one Parquet file, possibly under filters
-/// and projections. Its byte-range partitions are consecutive key ranges.
-fn single_file_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    match passthrough(plan) {
-        Some(child) => single_file_scan(child),
-        None => parquet_files(plan).is_some_and(|f| f.len() == 1),
-    }
-}
-
-/// Partitions are consecutive key ranges: a single-file scan, through
-/// order-preserving nodes and the probe side of a `CollectLeft` inner join.
-fn range_partitioned(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if let Some(child) = passthrough(plan) {
-        return range_partitioned(child);
-    }
-    if let Some(hj) = plan.downcast_ref::<HashJoinExec>()
-        && *hj.partition_mode() == PartitionMode::CollectLeft
-        && *hj.join_type() == JoinType::Inner
-        && hj.maintains_input_order().get(1).copied().unwrap_or(false)
-    {
-        return range_partitioned(hj.right());
-    }
-    single_file_scan(plan)
-}
-
-/// Turn off file-stream work stealing in the scan under a range-partitioned
-/// plan (DataFusion 55 lets sibling partitions of an unordered scan steal
-/// each other's byte ranges, so a partition would no longer be one range).
-fn pin_order(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-    let opts = || ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
-    if let Some(child) = passthrough(&plan) {
-        let child = pin_order(Arc::clone(child))?;
-        return Arc::clone(&plan).replace_children(vec![child], opts());
-    }
-    if let Some(hj) = plan.downcast_ref::<HashJoinExec>() {
-        let (l, r) = (Arc::clone(hj.left()), pin_order(Arc::clone(hj.right()))?);
-        return Arc::clone(&plan).replace_children(vec![l, r], opts());
-    }
-    if plan.is::<DataSourceExec>() {
-        return Ok(plan.with_preserve_order(true).unwrap_or(plan));
-    }
-    Ok(plan)
-}
-
-/// Re-split the single-file Parquet scan under `plan` (through filters and
-/// projections) into consecutive byte ranges of about `size / target` bytes.
-/// For one file this is DataFusion's own `repartition_evenly_by_size`.
-/// Returns `None` if `plan` is not such a scan or no split applies.
-fn resplit(
-    plan: &Arc<dyn ExecutionPlan>,
-    target: usize,
-    config: &ConfigOptions,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if let Some(child) = passthrough(plan) {
-        let Some(new_child) = resplit(child, target, config)? else {
-            return Ok(None);
+    fn required_columns(
+        &self,
+        inputs: &[SchemaRef],
+        projection: &[usize],
+    ) -> Result<Vec<Option<Vec<String>>>> {
+        let [l, r] = two(inputs)?;
+        let outputs = self.output_columns(l, r)?;
+        let keep = |schema: &Schema, side: Side, keys: Vec<&String>| -> Vec<String> {
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .filter(|n| {
+                    keys.contains(&n)
+                        || projection.iter().any(|&i| outputs[i].side == side && &outputs[i].column == n)
+                })
+                .collect()
         };
-        let node = Arc::clone(plan).replace_children(
-            vec![new_child],
-            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )?;
-        return Ok(Some(node));
-    }
-    let Some(dse) = plan.downcast_ref::<DataSourceExec>() else {
-        return Ok(None);
-    };
-    let Some((conf, _)) = dse.downcast_to_file_source::<ParquetSource>() else {
-        return Ok(None);
-    };
-    let Some(file) = conf.file_groups.iter().flat_map(|g| g.iter()).next() else {
-        return Ok(None);
-    };
-    if parquet_files(plan).is_none_or(|f| f.len() != 1) {
-        return Ok(None);
-    }
-    let size = file.object_meta.size;
-    if !config.optimizer.repartition_file_scans
-        || target <= 1
-        || size < config.optimizer.repartition_file_min_size as u64
-        || conf.file_compression_type.is_compressed()
-    {
-        return Ok(None);
-    }
-    let mut template = file.clone();
-    template.range = None;
-    let chunk = size.div_ceil(target as u64).max(1);
-    let mut groups = Vec::new();
-    let mut start = 0u64;
-    while start < size {
-        let end = size.min(start + chunk);
-        groups.push(FileGroup::new(vec![template.clone().with_range(start as i64, end as i64)]));
-        start = end;
-    }
-    if groups.len() <= conf.file_groups.len() {
-        return Ok(None);
-    }
-    let new_conf = FileScanConfigBuilder::from(conf.clone())
-        .with_file_groups(groups)
-        .build();
-    Ok(Some(DataSourceExec::from_data_source(new_conf) as Arc<dyn ExecutionPlan>))
-}
-
-static LAST_PLAN: Mutex<Option<String>> = Mutex::new(None);
-
-/// The physical plan of the most recent `asof_join` scan in this process
-/// (indented), for debugging and tests.
-pub fn last_plan() -> Option<String> {
-    LAST_PLAN.lock().ok().and_then(|g| g.clone())
-}
-
-pub(crate) fn set_last_plan(plan: &Arc<dyn ExecutionPlan>) {
-    let s = displayable(plan.as_ref()).indent(true).to_string();
-    if let Ok(mut g) = LAST_PLAN.lock() {
-        *g = Some(s);
-    }
-}
-
-/// Leaf node holding a finished join plan.
-///
-/// A plan handed to another session (over FFI, or through a table provider)
-/// is optimized again by that session, and DataFusion's distribution and
-/// sorting rules would see the scans below the join and repartition or merge
-/// them. As a leaf with the inner plan's properties (one ordered partition)
-/// it is left alone; the inner plan is already in final form.
-///
-/// If `runtime` is set, `execute` and every poll of the output stream run
-/// inside that tokio runtime (needed when the caller lives in another shared
-/// library with its own copy of tokio).
-pub struct AsofJoinScanExec {
-    inner: Arc<dyn ExecutionPlan>,
-    runtime: Option<tokio::runtime::Handle>,
-    cache: Arc<PlanProperties>,
-}
-
-impl fmt::Debug for AsofJoinScanExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AsofJoinScanExec").field("inner", &self.inner.name()).finish()
-    }
-}
-
-impl AsofJoinScanExec {
-    pub fn new(inner: Arc<dyn ExecutionPlan>, runtime: Option<tokio::runtime::Handle>) -> Self {
-        let p = inner.properties();
-        let cache = PlanProperties::new(
-            EquivalenceProperties::clone(p.equivalence_properties()),
-            p.output_partitioning().clone(),
-            p.emission_type,
-            p.boundedness,
-        );
-        Self {
-            inner,
-            runtime,
-            cache: Arc::new(cache),
-        }
+        let lk = std::iter::once(&self.left_on).chain(&self.by_left).collect();
+        let rk = std::iter::once(&self.right_on).chain(&self.by_right).collect();
+        Ok(vec![Some(keep(l, Side::Left, lk)), Some(keep(r, Side::Right, rk))])
     }
 
-    pub fn inner(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.inner
-    }
-}
-
-impl DisplayAs for AsofJoinScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        match t {
-            DisplayFormatType::TreeRender => write!(f, "AsofJoinScanExec"),
-            _ => {
-                let inner = displayable(self.inner.as_ref()).indent(false).to_string();
-                let inner = inner.trim_end().replace('\n', " <- ");
-                write!(f, "AsofJoinScanExec: [{inner}]")
-            }
-        }
-    }
-}
-
-impl ExecutionPlan for AsofJoinScanExec {
-    fn name(&self) -> &str {
-        "AsofJoinScanExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.cache
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn apply_expressions(
+    fn build(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
-    ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn replace_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-        _options: ReplaceChildrenOptions,
+        schemas: &[SchemaRef],
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        projection: &[usize],
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return plan_err!("AsofJoinScanExec has no children");
-        }
-        Ok(self)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return plan_err!("AsofJoinScanExec has no children");
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        match &self.runtime {
-            None => self.inner.execute(partition, context),
-            Some(rt) => {
-                let _g = rt.enter();
-                let inner = self.inner.execute(partition, context)?;
-                Ok(Box::pin(InRuntime {
-                    inner: Some(inner),
-                    rt: rt.clone(),
-                }))
-            }
-        }
-    }
-
-    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
-        self.inner.metrics()
+        let [l, r] = two(schemas)?;
+        let all = self.output_columns(l, r)?;
+        let outputs: Vec<OutputColumn> = projection.iter().map(|i| all[*i].clone()).collect();
+        let [left, right]: [Arc<dyn ExecutionPlan>; 2] = inputs
+            .try_into()
+            .map_err(|_| plan_datafusion_err!("join_asof takes two inputs"))?;
+        self.build_with_outputs(left, right, &outputs, config)
     }
 }
 
-/// Polls (and drops) `inner` inside `rt`.
-struct InRuntime {
-    inner: Option<SendableRecordBatchStream>,
-    rt: tokio::runtime::Handle,
-}
-
-impl Stream for InRuntime {
-    type Item = Result<arrow::array::RecordBatch>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let _g = self.rt.enter();
-        match self.inner.as_mut() {
-            Some(s) => s.as_mut().poll_next(cx),
-            None => std::task::Poll::Ready(None),
-        }
-    }
-}
-
-impl RecordBatchStream for InRuntime {
-    fn schema(&self) -> SchemaRef {
-        self.inner
-            .as_ref()
-            .map(|s| s.schema())
-            .unwrap_or_else(|| Arc::new(Schema::empty()))
-    }
-}
-
-impl Drop for InRuntime {
-    fn drop(&mut self) {
-        let _g = self.rt.enter();
-        self.inner = None;
+/// The two schemas of a two-input node.
+pub(crate) fn two(inputs: &[SchemaRef]) -> Result<[&Schema; 2]> {
+    match inputs {
+        [l, r] => Ok([l.as_ref(), r.as_ref()]),
+        _ => plan_err!("expected two inputs, got {}", inputs.len()),
     }
 }

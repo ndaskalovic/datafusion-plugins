@@ -1,9 +1,12 @@
-"""Fast streaming ``join_asof`` for datafusion-python 55, with polars semantics.
+"""Custom DataFusion operators for datafusion-python 55.
 
-:func:`join_asof` takes two :class:`datafusion.DataFrame` inputs and returns a
+* :func:`join_asof`: streaming ASOF join with polars semantics.
+* :func:`join_asof_markouts`: ASOF joins at several time offsets in one pass.
+
+Each takes :class:`datafusion.DataFrame` inputs and returns a
 :class:`datafusion.DataFrame`, so you keep chaining ``.filter(...)``,
-``.aggregate(...)``, ``.to_polars()`` and so on. Its arguments, output
-columns and contract follow polars ``DataFrame.join_asof``:
+``.aggregate(...)``, ``.to_polars()`` and so on. :func:`join_asof`'s
+arguments, output columns and contract follow polars ``DataFrame.join_asof``:
 
 * backward search: for every left row, the last right row with equal ``by``
   values and ``right.on <= left.on`` (``<`` with
@@ -18,15 +21,17 @@ datafusion-python's FFI layer.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from typing import Literal
+from decimal import Decimal
+from typing import Any, Literal
 
 from datafusion import DataFrame, SessionContext
 
-from ._internal import AsofJoinTable, __version__, ffi_version
+from ._internal import PlanTable, __version__, ffi_version
 from ._internal import last_plan as _last_plan
 
-__all__ = ["__version__", "join_asof", "last_plan"]
+__all__ = ["__version__", "join_asof", "join_asof_markouts", "last_plan"]
 
 
 def _names(arg: str | Sequence[str] | None) -> list[str] | None:
@@ -35,6 +40,46 @@ def _names(arg: str | Sequence[str] | None) -> list[str] | None:
     if isinstance(arg, str):
         return [arg]
     return list(arg)
+
+
+def _by_args(
+    by: str | Sequence[str] | None,
+    by_left: str | Sequence[str] | None,
+    by_right: str | Sequence[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Resolve ``by`` / ``by_left`` + ``by_right`` as polars does."""
+    by_l, by_r = _names(by_left), _names(by_right)
+    if by is not None:
+        if by_l is not None or by_r is not None:
+            msg = "give either 'by' or both 'by_left' and 'by_right', not both"
+            raise ValueError(msg)
+        by_l = by_r = _names(by)
+    elif (by_l is None) != (by_r is None):
+        msg = "expected both 'by_left' and 'by_right' to be set"
+        raise ValueError(msg)
+    by_l, by_r = by_l or [], by_r or []
+    if len(by_l) != len(by_r):
+        msg = "'by_left' and 'by_right' must have the same length"
+        raise ValueError(msg)
+    return by_l, by_r
+
+
+def _node(
+    name: str, inputs: Sequence[DataFrame], args: dict[str, Any], ctx: SessionContext | None
+) -> DataFrame:
+    """Run node ``name`` over ``inputs``: their logical plans go to the plugin,
+    which plans them and returns an FFI table provider."""
+    ctx = ctx if ctx is not None else SessionContext.global_ctx()
+    try:
+        plans = [df.logical_plan().to_bytes(ctx) for df in inputs]
+    except Exception as e:
+        msg = (
+            f"{name}: an input DataFrame cannot be serialized ({e}). On datafusion "
+            "55 inputs must be file-sourced; in-memory tables and Python UDFs are "
+            "not supported."
+        )
+        raise ValueError(msg) from e
+    return ctx.read_table(PlanTable(name, plans, args))
 
 
 def join_asof(
@@ -113,47 +158,92 @@ def join_asof(
     elif left_on is None or right_on is None:
         msg = "join_asof: give either 'on' or both 'left_on' and 'right_on'"
         raise ValueError(msg)
-    by_l, by_r = _names(by_left), _names(by_right)
-    if by is not None:
-        if by_l is not None or by_r is not None:
-            msg = "join_asof: give either 'by' or both 'by_left' and 'by_right', not both"
-            raise ValueError(msg)
-        by_l = by_r = _names(by)
-    elif (by_l is None) != (by_r is None):
-        msg = "join_asof: expected both 'by_left' and 'by_right' to be set"
-        raise ValueError(msg)
-    by_l, by_r = by_l or [], by_r or []
-    if len(by_l) != len(by_r):
-        msg = "join_asof: 'by_left' and 'by_right' must have the same length"
-        raise ValueError(msg)
-
-    ctx = ctx if ctx is not None else SessionContext.global_ctx()
     try:
-        lb = left.logical_plan().to_bytes(ctx)
-        rb = right.logical_plan().to_bytes(ctx)
-    except Exception as e:
-        msg = (
-            "join_asof: an input DataFrame cannot be serialized "
-            f"({e}). On datafusion 55 inputs must be file-sourced; "
-            "in-memory tables and Python UDFs are not supported."
-        )
-        raise ValueError(msg) from e
-    table = AsofJoinTable(
-        lb,
-        rb,
-        left_on,
-        right_on,
-        by_l,
-        by_r,
-        allow_exact_matches=allow_exact_matches,
-        suffix=suffix,
-        check_sortedness=check_sortedness,
-    )
-    return ctx.read_table(table)
+        by_l, by_r = _by_args(by, by_left, by_right)
+    except ValueError as e:
+        raise ValueError(f"join_asof: {e}") from None
+    args = {
+        "left_on": left_on,
+        "right_on": right_on,
+        "by_left": by_l,
+        "by_right": by_r,
+        "allow_exact_matches": allow_exact_matches,
+        "suffix": suffix,
+        "check_sortedness": check_sortedness,
+    }
+    return _node("join_asof", [left, right], args, ctx)
+
+
+def _markout_str(h: object) -> str:
+    """An int or float markout as an exact plain decimal string."""
+    if isinstance(h, bool) or not isinstance(h, (int, float)):
+        msg = f"join_asof_markouts: markouts must be ints or floats, got {h!r}"
+        raise TypeError(msg)
+    if isinstance(h, float) and not math.isfinite(h):
+        msg = f"join_asof_markouts: markouts must be finite, got {h!r}"
+        raise ValueError(msg)
+    d = Decimal(h) if isinstance(h, int) else Decimal(repr(h))
+    return format(d, "f")
+
+
+def join_asof_markouts(
+    left: DataFrame,
+    right: DataFrame,
+    on: str,
+    markouts: Sequence[int | float],
+    *,
+    by: str | Sequence[str] | None = None,
+    by_left: str | Sequence[str] | None = None,
+    by_right: str | Sequence[str] | None = None,
+    allow_exact_matches: bool = True,
+    ctx: SessionContext | None = None,
+) -> DataFrame:
+    """Backward ASOF joins at several time offsets, in one pass.
+
+    For each left row and each markout ``h`` (seconds), the last right row of
+    the same ``by`` group with ``right[on] <= left[on] + h`` (``<`` with
+    ``allow_exact_matches=False``): what polars gives for
+    ``left.with_columns(pl.col(on) + timedelta(seconds=h)).join_asof(right,
+    on=on, by=by, strategy="backward")``, for every ``h`` side by side.
+
+    Args:
+        left: Left input. Its rows are kept, once each, in order.
+        right: Right input.
+        on: A Timestamp column (any unit, with or without a time zone) of the
+            same type in both inputs.
+        markouts: Offsets in seconds (ints or floats; negative, zero and
+            fractional allowed; no duplicates). Each must be a whole number
+            of the column's unit.
+        by: Equality column, the same name on both sides (one integer-like
+            column), or ``by_left`` and ``by_right``.
+        allow_exact_matches: If False, require ``right[on] < left[on] + h``.
+        ctx: The SessionContext the inputs belong to (default: global).
+
+    Returns:
+        All left columns, then for each markout in the given order every
+        right column except ``on`` and ``by``, suffixed ``_{h}s`` (``_1s``,
+        ``_0.5s``, ``_-5s``).
+
+    Inputs are assumed sorted by ``(by..., on)`` (or ``on``) and are not
+    validated beyond batch and partition boundaries. They must be scans of
+    one Parquet file each, optionally filtered or projected.
+    """
+    try:
+        by_l, by_r = _by_args(by, by_left, by_right)
+    except ValueError as e:
+        raise ValueError(f"join_asof_markouts: {e}") from None
+    args = {
+        "on": on,
+        "markouts": [_markout_str(h) for h in markouts],
+        "by_left": by_l,
+        "by_right": by_r,
+        "allow_exact_matches": allow_exact_matches,
+    }
+    return _node("join_asof_markouts", [left, right], args, ctx)
 
 
 def last_plan() -> str | None:
-    """The physical plan of the most recent join planned in this process.
+    """The physical plan most recently built by a node in this process.
 
     Planning happens when a result is executed (``collect``, ``to_polars``,
     ...) or explained. Use it to check which mode ran (range-parallel, or

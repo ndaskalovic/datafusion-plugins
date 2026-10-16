@@ -731,26 +731,26 @@ impl ExecutionPlan for StreamingAsOfJoinExec {
 // Shared per-execution state
 // ---------------------------------------------------------------------------
 
-type LeftStart = (VecDeque<RecordBatch>, Option<SendableRecordBatchStream>);
+pub(crate) type LeftStart = (VecDeque<RecordBatch>, Option<SendableRecordBatchStream>);
 
 pub(crate) struct Prologue<TN: TsNative, G: GroupKind> {
     /// Peeked batches + remaining stream of each left partition (taken once).
-    left: Mutex<Vec<Option<LeftStart>>>,
+    pub(crate) left: Mutex<Vec<Option<LeftStart>>>,
     /// First valid key of each left partition (`None` = no valid rows).
-    left_first: Vec<Option<Key<TN, G>>>,
+    pub(crate) left_first: Vec<Option<Key<TN, G>>>,
     /// Non-empty right partitions sorted by first key...
-    right_order: Vec<usize>,
+    pub(crate) right_order: Vec<usize>,
     /// ...and their first keys (same order).
-    right_first: Vec<Key<TN, G>>,
+    pub(crate) right_first: Vec<Key<TN, G>>,
 }
 
 pub(crate) struct SharedRun<TN: TsNative, G: GroupKind> {
-    prologue: tokio::sync::OnceCell<Arc<Prologue<TN, G>>>,
-    claimed: Vec<AtomicBool>,
+    pub(crate) prologue: tokio::sync::OnceCell<Arc<Prologue<TN, G>>>,
+    pub(crate) claimed: Vec<AtomicBool>,
 }
 
 impl<TN: TsNative, G: GroupKind> SharedRun<TN, G> {
-    fn new(n_left: usize) -> Self {
+    pub(crate) fn new(n_left: usize) -> Self {
         Self {
             prologue: tokio::sync::OnceCell::new(),
             claimed: (0..n_left).map(|_| AtomicBool::new(false)).collect(),
@@ -758,7 +758,7 @@ impl<TN: TsNative, G: GroupKind> SharedRun<TN, G> {
     }
 }
 
-fn join_err(e: tokio::task::JoinError) -> DataFusionError {
+pub(crate) fn join_err(e: tokio::task::JoinError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
@@ -808,7 +808,7 @@ async fn peek_left<TN: TsNative, G: GroupKind>(
     Ok(((batches, None), None))
 }
 
-async fn init_prologue<TN: TsNative, G: GroupKind>(
+pub(crate) async fn init_prologue<TN: TsNative, G: GroupKind>(
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
     ctx: Arc<TaskContext>,
@@ -1185,7 +1185,7 @@ async fn run_fanout<TN: TsNative, G: GroupKind>(
     Ok(())
 }
 
-async fn next_left(
+pub(crate) async fn next_left(
     peeked: &mut VecDeque<RecordBatch>,
     stream: &mut Option<SendableRecordBatchStream>,
 ) -> Result<Option<RecordBatch>> {

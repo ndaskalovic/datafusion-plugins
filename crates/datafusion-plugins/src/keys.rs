@@ -176,6 +176,10 @@ pub trait GroupKind: Send + Sync + 'static {
     fn cmp_at(&self, a: &Self::Col, i: usize, b: &Self::Col, j: usize) -> Ordering;
     fn cmp_owned(&self, a: &Self::Owned, b: &Self::Col, j: usize) -> Ordering;
     fn key_owned(&self, c: &Self::Col, i: usize) -> Self::Owned;
+    /// The group half of a packed key for an owned key (packing kinds only).
+    fn owned_packed(&self, _k: &Self::Owned) -> Option<i64> {
+        None
+    }
 }
 
 /// Ungrouped join: one implicit group.
@@ -187,6 +191,12 @@ pub struct NoGroup;
 #[inline]
 pub fn pack_key(g: i64, t: i64) -> i128 {
     ((g as i128) << 64) | (((t as u64) ^ (1u64 << 63)) as i128)
+}
+
+/// The ts half of a packed key.
+#[inline]
+pub fn packed_ts(k: i128) -> i64 {
+    ((k as u64) ^ (1u64 << 63)) as i64
 }
 
 /// The group half of a packed key.
@@ -216,6 +226,9 @@ impl GroupKind for NoGroup {
     }
     #[inline]
     fn key_owned(&self, _c: &(), _i: usize) {}
+    fn owned_packed(&self, _k: &()) -> Option<i64> {
+        Some(0)
+    }
 }
 
 /// One primitive `by` key.
@@ -260,6 +273,9 @@ impl<GN: TsNative> GroupKind for PrimGroup<GN> {
     #[inline]
     fn key_owned(&self, c: &KeyCol<GN>, i: usize) -> GN {
         c.as_slice()[i]
+    }
+    fn owned_packed(&self, k: &GN) -> Option<i64> {
+        Some(TsNative::to_i64(*k))
     }
 }
 

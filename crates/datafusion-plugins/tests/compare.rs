@@ -24,7 +24,7 @@ use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext, col};
-use datafusion_plugins::{AsofOptions, AsofPlanTable, JoinAsof};
+use datafusion_plugins::{AsofOptions, JoinAsof, PlanBytesTable};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum By {
@@ -316,7 +316,7 @@ async fn run_plan_bytes(c: &Case, dir: &std::path::Path) -> (Rows, String) {
     let r = read(&ctx, c, &dir.join("right.parquet"), true).await;
     let lb = datafusion_proto::bytes::logical_plan_to_bytes(l.logical_plan()).unwrap();
     let rb = datafusion_proto::bytes::logical_plan_to_bytes(r.logical_plan()).unwrap();
-    let table = AsofPlanTable::try_new(lb.to_vec(), rb.to_vec(), join(c), None).unwrap();
+    let table = PlanBytesTable::try_new(vec![lb.to_vec(), rb.to_vec()], Arc::new(join(c)), None).unwrap();
     let schema = table.schema();
     let proj = vec![schema.index_of("id").unwrap(), schema.index_of("rid").unwrap()];
     let plan = table.plan(ctx.state().config_options(), Some(&proj)).await.unwrap();

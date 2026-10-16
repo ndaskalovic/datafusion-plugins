@@ -10,10 +10,12 @@ use std::sync::{Arc, OnceLock};
 
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
-use datafusion_plugins::{AsofOptions, AsofPlanTable, JoinAsof, last_plan};
+use datafusion_plugins::{
+    AsofOptions, JoinAsof, JoinAsofMarkouts, Markout, PlanBytesTable, PlanNode, last_plan,
+};
 use pyo3::exceptions::{PyImportError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
+use pyo3::types::{PyCapsule, PyDict};
 
 /// This library's tokio runtime. Worker threads: `DATAFUSION_PLUGINS_THREADS`
 /// if set, else the number of CPUs. Read once, at first use.
@@ -67,42 +69,67 @@ fn logical_codec(session: &Bound<'_, PyAny>) -> PyResult<FFI_LogicalExtensionCod
     Ok(codec.clone())
 }
 
-/// A `join_asof` of two serialized logical plans, as a table provider.
-#[pyclass(name = "AsofJoinTable", module = "datafusion_plugins._internal", frozen)]
-struct PyAsofJoinTable {
-    table: Arc<AsofPlanTable>,
+// ---------------------------------------------------------------------------
+// Nodes: one builder per node, from the Python keyword arguments.
+// ---------------------------------------------------------------------------
+
+fn arg<'py, T: FromPyObjectOwned<'py>>(args: &Bound<'py, PyDict>, key: &str) -> PyResult<T> {
+    match args.get_item(key)? {
+        Some(v) => v.extract().map_err(Into::into),
+        None => Err(PyValueError::new_err(format!("missing argument {key:?}"))),
+    }
+}
+
+fn join_asof(args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>> {
+    Ok(Arc::new(
+        JoinAsof::new_with(arg::<String>(args, "left_on")?, arg::<String>(args, "right_on")?)
+            .by_left_right(arg::<Vec<String>>(args, "by_left")?, arg::<Vec<String>>(args, "by_right")?)
+            .allow_exact_matches(arg(args, "allow_exact_matches")?)
+            .suffix(arg::<String>(args, "suffix")?)
+            .check_sortedness(arg(args, "check_sortedness")?)
+            .options(AsofOptions::from_env()),
+    ))
+}
+
+fn join_asof_markouts(args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>> {
+    let markouts = arg::<Vec<String>>(args, "markouts")?
+        .iter()
+        .map(|m| Markout::parse(m))
+        .collect::<datafusion::common::Result<Vec<_>>>()
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(Arc::new(
+        JoinAsofMarkouts::new(arg::<String>(args, "on")?, markouts)
+            .by_left_right(arg::<Vec<String>>(args, "by_left")?, arg::<Vec<String>>(args, "by_right")?)
+            .allow_exact_matches(arg(args, "allow_exact_matches")?)
+            .options(AsofOptions::from_env()),
+    ))
+}
+
+/// The node registry: name -> builder.
+fn make_node(name: &str, args: &Bound<'_, PyDict>) -> PyResult<Arc<dyn PlanNode>> {
+    match name {
+        "join_asof" => join_asof(args),
+        "join_asof_markouts" => join_asof_markouts(args),
+        other => Err(PyValueError::new_err(format!("unknown node {other:?}"))),
+    }
+}
+
+/// A node over serialized logical plans, as a table provider.
+#[pyclass(name = "PlanTable", module = "datafusion_plugins._internal", frozen)]
+struct PyPlanTable {
+    table: Arc<PlanBytesTable>,
 }
 
 #[pymethods]
-impl PyAsofJoinTable {
+impl PyPlanTable {
     #[new]
-    #[pyo3(signature = (left, right, left_on, right_on, by_left, by_right, allow_exact_matches = true, suffix = "_right".to_string(), check_sortedness = true))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        left: Vec<u8>,
-        right: Vec<u8>,
-        left_on: String,
-        right_on: String,
-        by_left: Vec<String>,
-        by_right: Vec<String>,
-        allow_exact_matches: bool,
-        suffix: String,
-        check_sortedness: bool,
-    ) -> PyResult<Self> {
-        let join = JoinAsof::new_with(left_on, right_on)
-            .by_left_right(by_left, by_right)
-            .allow_exact_matches(allow_exact_matches)
-            .suffix(suffix)
-            .check_sortedness(check_sortedness)
-            .options(AsofOptions::from_env());
+    fn new(py: Python<'_>, node: &str, inputs: Vec<Vec<u8>>, args: Bound<'_, PyDict>) -> PyResult<Self> {
+        let node = make_node(node, &args)?;
         let handle = runtime().handle().clone();
         let table = py
-            .detach(|| AsofPlanTable::try_new(left, right, join, Some(handle)))
+            .detach(|| PlanBytesTable::try_new(inputs, node, Some(handle)))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self {
-            table: Arc::new(table),
-        })
+        Ok(Self { table: Arc::new(table) })
     }
 
     fn __datafusion_table_provider__<'py>(
@@ -121,7 +148,7 @@ impl PyAsofJoinTable {
     }
 }
 
-/// The physical plan of the most recent asof join planned in this process.
+/// The physical plan most recently built by a node in this process.
 #[pyfunction(name = "last_plan")]
 fn py_last_plan() -> Option<String> {
     last_plan()
@@ -135,7 +162,7 @@ fn ffi_version() -> u64 {
 
 #[pymodule]
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyAsofJoinTable>()?;
+    m.add_class::<PyPlanTable>()?;
     m.add_function(wrap_pyfunction!(py_last_plan, m)?)?;
     m.add_function(wrap_pyfunction!(ffi_version, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

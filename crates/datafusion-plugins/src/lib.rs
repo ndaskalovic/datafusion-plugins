@@ -1,13 +1,16 @@
-//! Streaming, range-parallel backward ASOF join for Apache DataFusion 55,
-//! with polars `join_asof(strategy="backward")` semantics.
+//! Custom operators for Apache DataFusion 55, usable from Rust and (through
+//! the datafusion-python FFI) from Python.
 //!
-//! * [`JoinAsof`]: build the join over two physical plans. Inputs must be
-//!   sorted by `(by..., on)` (or `on`); nothing is sorted for you.
-//! * [`AsofPlanTable`]: the join of two datafusion-proto serialized logical
-//!   plans, as a table provider (how DataFrames from another DataFusion
-//!   instance, such as datafusion-python, become inputs).
-//! * [`StreamingAsOfJoinExec`], [`OrderedConcatExec`], [`AsofJoinScanExec`]:
-//!   the operators.
+//! Nodes:
+//! * [`JoinAsof`]: streaming backward ASOF join with polars `join_asof`
+//!   semantics.
+//! * [`JoinAsofMarkouts`]: ASOF joins at several time offsets ("markouts")
+//!   in one pass over the right input.
+//!
+//! Each node implements [`PlanNode`] (physical input plans in, physical plan
+//! out), so [`PlanBytesTable`] can run it over serialized logical plans, the
+//! way the Python package does. [`BridgeExec`] is the leaf the plan is handed
+//! out in; [`OrderedConcatExec`] is a reusable building block.
 //!
 //! ```no_run
 //! # async fn example() -> datafusion::common::Result<()> {
@@ -31,14 +34,19 @@
 //! # Ok(()) }
 //! ```
 
+mod bridge;
 mod exec;
+mod join_asof;
 mod kernel;
 mod keys;
+mod markouts;
 mod ordered;
-mod plan;
 mod plan_bytes;
+mod scan;
 
+pub use bridge::{BridgeExec, last_plan};
 pub use exec::{AsofOptions, StreamingAsOfJoinExec};
+pub use join_asof::{JoinAsof, OutputColumn, Side};
+pub use markouts::{JoinAsofMarkouts, Markout, MarkoutsExec};
 pub use ordered::OrderedConcatExec;
-pub use plan::{AsofJoinScanExec, JoinAsof, OutputColumn, Side, last_plan};
-pub use plan_bytes::AsofPlanTable;
+pub use plan_bytes::{PlanBytesTable, PlanNode};
